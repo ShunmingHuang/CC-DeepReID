@@ -1,0 +1,98 @@
+# LTCC Dataset Configuration for ResNet
+# Based on configs/default.py
+
+# -----------------------------------------------------------------------------
+# MODEL
+# -----------------------------------------------------------------------------
+MODEL:
+  DEVICE: "cuda"
+  NAME: "resnet"
+  LAST_STRIDE: 1
+  PRETRAIN: "pretrain/resnet50-pretrained.pth"
+  NECK: "bnneck"
+  ID_LOSS_WEIGHT: 1.0
+  TRIPLET_LOSS_WEIGHT: 1.0
+  FEAT_DIM: 2048
+  NO_MARGIN: False
+  LABELSMOOTH: True
+  # ---- dual-branch channel attention behind the backbone ----
+  #  F  = id branch      : ID + triplet
+  #  F' = cloth branch   : ID-style softmax over the cloth vocabulary
+  #  F vs F'             : pushed apart (orthogonal)
+  DUAL_BRANCH: True
+  ATT_REDUCTION: 16
+  CLOTH_FEAT_DIM: -1        # -1 -> F' keeps 2048 dims (same width as F)
+  ATT_PROJECTOR: False
+  CLOTH_LOSS_WEIGHT: 1.0
+  DISENTANGLE_WEIGHT: 1.0
+  DISENTANGLE_MARGIN: null  # null -> |cos| (CSCI); a float switches to a hinge
+
+# -----------------------------------------------------------------------------
+# INPUT
+# -----------------------------------------------------------------------------
+INPUT:
+  SIZE_TRAIN: [256, 128]
+  SIZE_TEST: [256, 128]
+  PROB: 0.5
+  RE_PROB: 0.5
+  PIXEL_MEAN: [0.485, 0.456, 0.406]
+  PIXEL_STD: [0.229, 0.224, 0.225]
+  PADDING: 10
+
+# -----------------------------------------------------------------------------
+# DATASETS
+# -----------------------------------------------------------------------------
+DATASETS:
+  NAMES: "ltcc"
+  ROOT_DIR: "../data"
+
+# -----------------------------------------------------------------------------
+# DATALOADER
+# -----------------------------------------------------------------------------
+DATALOADER:
+  NUM_WORKERS: 8
+  SAMPLER: "triplet"
+  NUM_INSTANCE: 16
+
+# -----------------------------------------------------------------------------
+# SOLVER
+# -----------------------------------------------------------------------------
+SOLVER:
+  OPTIMIZER_NAME: "AdamW"
+  MAX_EPOCHS: 100
+  BASE_LR: 0.0003
+  SEED: 1234
+  MOMENTUM: 0.9
+  MARGIN: 0.3
+  WEIGHT_DECAY: 0.0005
+  WEIGHT_DECAY_BIAS: 0.0005
+  WARMUP_EPOCHS: 5
+  COSINE_MARGIN: 0.5
+  COSINE_SCALE: 30
+  LR_SCHEDULER: "cosine"
+  STEPSIZE: [40, 70]
+  GAMMA: 0.1
+  CHECKPOINT_PERIOD: 10
+  LOG_PERIOD: 10
+  EVAL_PERIOD: 10
+  IMS_PER_BATCH: 64
+
+# -----------------------------------------------------------------------------
+# TEST
+# -----------------------------------------------------------------------------
+TEST:
+  IMS_PER_BATCH: 128
+  WEIGHT: ""
+  NECK_FEAT: "after"
+  FEAT_NORM: True
+  # 'both' -> report CC (clothes-changing rule) AND General (standard rule)
+  # 'cc'   -> report only the clothes-changing protocol
+  MODE: "both"
+  EVAL_PROTOCOL: "CC"
+
+# -----------------------------------------------------------------------------
+# Misc
+# -----------------------------------------------------------------------------
+EXP_NAME: "ltcc_resnet"
+LOG_DIR: "logs/ltcc"
+OUTPUT_DIR: "outputs/ltcc"

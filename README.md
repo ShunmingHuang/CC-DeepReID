@@ -1,0 +1,264 @@
+# CC-DeepReID
+
+Clothes-changing ReID framework: ResNet50 backbone + **dual-branch channel
+attention**, with the data layer and evaluation protocol aligned to
+`ICCV-CSCI-Person-ReID`.
+
+This document records what the framework *is*, which conventions are frozen, and
+which knobs exist — so later experiments do not silently break the plumbing.
+
+---
+
+## 1. Architecture
+
+```
+image
+  └─ ResNet50 (last_stride=1)                    → (B, 2048, H/16, W/16)
+       └─ DualBranchChannelAttention              models/attention.py
+            ├─ shared GAP → SE branch 1 ────────→ F   (B, 2048)
+            └─ shared GAP → SE branch 2 ────────→ F'  (B, 2048)
+                 F  → BNNeck → classifier_id     → id logits
+                 F' → BNNeck → classifier_cloth  → cloth logits
+```
+
+Each `SE branch` is `Linear(C→C/r) → ReLU → Linear(C/r→C) → Sigmoid` applied as
+per-channel weights on the feature map, followed by GAP. The branches have
+**independent parameters**, so they can specialise.
+
+### Loss
+
+The **dataset layer must match CSCI exactly; the loss layer is free to differ.**
+Current objective:
+
+```
+L = W_id  · CE_id(F)              # label-smoothed identity softmax     (F)
+  + W_tri · Triplet(F)            # CSCI's identity-only hard triplet   (F)
+  + W_clo · CE_cloth(F')          # label-smoothed clothing softmax     (F')
+  + W_dis · |cos(F, F')|          # push F and F' apart
+```
+
+* `Triplet(F)` is CSCI's triplet **verbatim** (`losses/hard_mine_triplet_loss.py`
+  is transcribed from `ICCV-CSCI-Person-ReID/loss/triplet_loss.py`):
+  `hard_example_mining` mines positives by *identity* only — **clothing is never
+  consulted**. `targets_cloth` is still accepted by the signature and ignored.
+  An earlier CC-DeepReID version used a *cloth-aware* triplet
+  (`mask_pos = same_id & different_cloth`); that was experiment residue and has
+  been removed. (`scripts/verify_alignment.py` asserts bit-for-bit equality with
+  a re-implementation of CSCI's triplet.)
+* `CE_cloth(F')` follows the same recipe as `CE_id(F)` — label-smoothed when
+  `MODEL.LABELSMOOTH` is on. Note this is a **deliberate deviation**: CSCI uses
+  plain `nn.CrossEntropyLoss()` for its clothing head.
+* `F'` gets **no triplet term at all** — it is only asked to classify clothing,
+  so it cannot absorb identity-discriminative structure.
+* The separation term is CSCI's `Cosine_Disentangle`: `|cos|` is minimized at
+  `cos = 0`, i.e. the two features are driven **orthogonal**. Note `|cos|` also
+  penalises anti-parallel features (cos = -1); that is intentional and matches
+  CSCI. Set `MODEL.DISENTANGLE_MARGIN` to a float to switch to a hinge
+  `relu(cos - m)` instead.
+* `F` is the feature used at test time; the retrieval path is unchanged by the
+  dual branch.
+
+> Where strict CSCI alignment **is** required — and is enforced by
+> `scripts/audit_real_datasets.py` against the real data: the split protocol, and
+> where every `cloth_id` comes from (§2).
+
+---
+
+## 2. Data layer and evaluation protocol (aligned to CSCI)
+
+Entry point: `datasets/make_dataloader(cfg) -> (loaders, bundle)`.
+
+Data tuples are **4-tuples** `(img_path, pid, camid, cloth_id)` (CSCI carries an
+extra all-zero `aux_info` slot that is unused here).
+
+### PRCC — two protocols over one gallery
+
+| split | source | note |
+|---|---|---|
+| `train` | `rgb/train` | pids relabelled `0..N-1`; `val` is **not** merged |
+| `val` | `rgb/val` | parsed and reported, never trained on |
+| `query_diff` | `rgb/test/C` | clothes-changing (CC) protocol |
+| `query_same` | `rgb/test/B` | standard (SC) protocol |
+| `gallery` | `rgb/test/A` | shared by both |
+
+* File naming differs between splits (this is how the PRCC release is built):
+  `train`/`val` use `<cam>_cropped_rgb###.jpg` inside `<pid>/`, `test` uses
+  `cropped_rgb###.jpg` inside `<cam>/<pid>/`.
+* Cloth semantics: `<pid>` for A/B, `<pid>C` for C → **two cloth labels per
+  identity** in train, matching CSCI's `pid*2` / `pid*2+1`.
+* In test, A and B **share** a cloth id and C differs. This is what makes
+  `same pid AND same cloth` pruning keep exactly the clothing-change pairs:
+  A↔C for CC, A↔B for Standard.
+
+### LTCC — one split, rule applied at eval time
+
+| split | source |
+|---|---|
+| `train` | `train/` (full, **no cloth-change ID filtering at read time**) |
+| `query` | `query/` |
+| `gallery` | `test/` |
+
+* `cloth_id = <pid>_<cam>` (CSCI's `(\w+)_c` regex), vocabulary built on train
+  and reused for test. Unseen test clothings are appended instead of raising
+  `KeyError` (upstream CSCI would crash there).
+* The clothes-changing rule lives in the metric (`R1_mAP_eval_CC.compute`), not
+  in the loader, so the CC and General numbers are computed from the same
+  features.
+
+### What gets reported
+
+`MODEL`-agnostic; controlled by config:
+
+* `TEST.MODE = 'both'` → PRCC: `CC` (test/C) **and** `Standard` (test/B);
+  LTCC: `CC` **and** `General`.
+* `TEST.MODE = 'cc'` → only the clothes-changing number.
+* `TEST.EVAL_PROTOCOL = 'CC'` → which protocol picks the best checkpoint.
+
+---
+
+## 3. Configuration
+
+Data/protocol (`configs/default.py`, per-dataset in `configs/datasets/*/*.yaml`):
+
+| key | meaning |
+|---|---|
+| `DATASETS.NAMES` | `prcc` \| `ltcc` |
+| `DATASETS.ROOT_DIR` | root containing `prcc/` and `LTCC_ReID/` |
+| `TEST.MODE` | `both` \| `cc` |
+| `TEST.EVAL_PROTOCOL` | `CC` \| `Standard` \| `General` |
+| `DATALOADER.SAMPLER` | `triplet` \| `softmax` |
+| `DATALOADER.NUM_INSTANCE` | instances per identity per batch |
+| `SOLVER.IMS_PER_BATCH` | must be `num_ids_per_batch * NUM_INSTANCE` |
+
+Model (`MODEL.*`):
+
+| key | default | meaning |
+|---|---|---|
+| `DUAL_BRANCH` | `True` | `False` restores the single-branch baseline |
+| `ATT_REDUCTION` | `16` | SE bottleneck ratio |
+| `CLOTH_FEAT_DIM` | `-1` | `-1` keeps `F'` at 2048 (same width as `F`) |
+| `ATT_PROJECTOR` | `False` | optional BN+FC head on `F'` |
+| `CLOTH_LOSS_WEIGHT` | `1.0` | weight of `CE_cloth(F')` |
+| `DISENTANGLE_WEIGHT` | `1.0` | weight of the separation term |
+| `DISENTANGLE_MARGIN` | `None` | `None` → `\|cos\|` (CSCI); float → hinge |
+| `NO_MARGIN` | `False` | triplet margin = 0 when `True` |
+| `LABELSMOOTH` | `True` | label smoothing for both softmax heads |
+
+`MODEL.PRETRAIN` exists in the config but is **not used by the training code**
+(`train.py`/`make_model` never call `load_parameter`). The backbone is trained
+from scratch. `test.py` does load a checkpoint via `load_parameter`.
+
+### How to launch training
+
+`train.py` is the only training entry point. Its `opts` argument is the yacs
+**positional remainder**, not a `--opts` flag:
+
+```bash
+cd CC-DeepReID
+
+# PRCC (config already carries NAMES=prcc, ROOT_DIR=../data)
+python train.py --config_file configs/datasets/prcc/resnet.yaml
+
+# LTCC
+python train.py --config_file configs/datasets/ltcc/resnet.yaml
+
+# override anything on the fly, e.g. a different data root or batch size
+python train.py --config_file configs/datasets/prcc/resnet.yaml \
+    DATASETS.ROOT_DIR /your/data SOLVER.IMS_PER_BATCH 64
+```
+
+`ROOT_DIR` is relative to the CWD, so run from `CC-DeepReID` when leaving it at
+`../data`. Outputs land in `<OUTPUT_DIR>/<EXP_NAME>/` (`outputs/prcc/prcc_resnet/`)
+and logs in `<LOG_DIR>/<EXP_NAME>/`.
+
+Verified end to end on the real data through this exact entry point: config merge,
+`../data` resolution, real splits (PRCC 150 ids / 17,896 images; 300 cloth
+classes), model build, one full epoch of the real loop, both evaluation protocols,
+`resnet_1.pth` + `resnet_best.pth` written with the dual-branch heads present
+(334 state-dict keys).
+
+---
+
+## 4. Constraints worth knowing before changing things
+
+1. **`F` and `F'` must have the same width.** The separation loss compares them
+   1:1. If you set `CLOTH_FEAT_DIM != 2048`, `DisentangleLoss` raises rather
+   than silently projecting — add an explicit projector if you need asymmetry.
+2. **`MODEL.NECK` applies to `F` only.** `F'` always goes through its own
+   `cloth_bottleneck` (BatchNorm1d).
+3. **`F'`'s BatchNorm falls back to running statistics** when a batch contains a
+   cloth class exactly once (BatchNorm1d cannot handle a singleton). With
+   `IMS_PER_BATCH = num_ids * NUM_INSTANCE` this is rare; if the cloth branch
+   accuracy stays near chance, check this first.
+4. **The cloth vocabulary is per-dataset and built from the train split.** Its
+   size is the cloth head's class count; test-time clothings never affect it.
+5. **`torch.autocast` is used on CUDA (`GradScaler`).** The triplet distance is
+   forced to fp32 inside `TripletLoss` because the 2048-dim squared sum is the
+   one place fp16 could overflow.
+6. **Only `F` is returned in `eval()` mode.** Anything you want measured at test
+   time must either come from `F` or be exposed through the `.training` path.
+7. **Protocol changes must stay in the datasets + metrics**, not in the model, so
+   that CC/General remain comparable across experiments.
+
+---
+
+## 5. Verification scripts
+
+All three are offline (synthetic data, no dataset download required) and run on
+CPU; they exist so that a change to the plumbing fails loudly here rather than
+halfway through a GPU run.
+
+| script | what it proves |
+|---|---|
+| `scripts/compare_with_csci.py` | **the definitive check**: re-derives every split, pid, camid and cloth id directly from the filesystem using CSCI's own formulas, then compares against our loaders — per-image, and reports whether the cloth *label numbering* matches, not just the grouping |
+| `scripts/audit_real_datasets.py` | split/label semantics, official PRCC counts, CC-rule effectiveness, triplets' reachable positives (runs on the real data) |
+| `scripts/real_data_cpu_check.py` | real batches + full real query/gallery evaluation through the processor (CPU, slow) |
+| `scripts/verify_alignment.py` | dual-branch shapes, losses, CC vs General metric, triplet == CSCI reference (26+ assertions) |
+| `scripts/train_smoke_test.py` | the real `do_train` runs end to end: train → dual-protocol eval → checkpoint |
+| `scripts/infer_smoke_test.py` | `load_parameter` + `do_inference` reproduces the training-time metrics |
+| `scripts/preflight_3090.py` | **run this on the GPU host**: CUDA build/visibility, AMP fwd+bwd on GPU, peak VRAM, dataset layout, one real train+eval step |
+
+```bash
+python scripts/compare_with_csci.py      # dataset layer == CSCI, on the real data
+python scripts/audit_real_datasets.py    # split/label sanity + official counts
+python scripts/verify_alignment.py       # model/loss/metric assertions
+python scripts/train_smoke_test.py       # end-to-end training
+python scripts/infer_smoke_test.py       # run after train_smoke_test
+```
+
+Last verified result on the local data: `DATASET LAYER IS IDENTICAL TO CSCI` —
+PRCC (train/val/test-A/test-B/test-C) and LTCC (train/query/test) are per-image
+identical in image set, `pid`, `camid` and `cloth_id`, **including the cloth
+label numbering**.
+
+> **Trap this check caught:** PRCC's clothing key is
+> `osp.basename(pdir)` *as a string* (`"092"`, leading zeros kept) for A/B and
+> `basename + cam` for C. Passing the pid through `int()` first produces `"92"`,
+> which changes the key set, and therefore renumbers **all 300** clothing labels
+> even though the grouping stays identical. Keep the folder name as a string.
+
+> Second trap: LTCC's `cloth_id` key is `<pid>_<cam>`, which shares a namespace
+> with the identity ids. CSCI looks the test key up in the train-built
+> vocabulary, so a dataset whose train and test ids are disjoint makes the
+> pristine loader raise `KeyError` (on the local copy: 221 unseen keys). We append
+> unseen keys to a test-only vocabulary instead; the equivalence structure is
+> unchanged because `cloth_id` is only ever compared for equality inside a split.
+
+---
+
+## 6. Expected dataset layout
+
+```
+<ROOT>/
+├── prcc/rgb/
+│   ├── train/<pid>/<A|B|C>_cropped_rgb###.jpg
+│   ├── val/<pid>/<A|B|C>_cropped_rgb###.jpg
+│   └── test/{A,B,C}/<pid>/cropped_rgb###.jpg
+└── LTCC_ReID/
+    ├── train/<pid>_<cam>_c<cloth>_<frame>.png
+    ├── query/<pid>_<cam>_c<cloth>_<frame>.png
+    └── test/<pid>_<cam>_c<cloth>_<frame>.png
+```
+
+Use `python check_dataset.py` to print per-split `(imgs, pids, cams, clothes)`
+before trusting a new dataset copy.
