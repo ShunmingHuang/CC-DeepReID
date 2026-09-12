@@ -31,12 +31,14 @@ class ResNet(nn.Module):
 
     Forward outputs:
 
-    * ``training``   -> ``(id_score, feat_id, cloth_score, feat_cloth, global_feat)``
-    * ``eval``       -> ``feat_id`` only (retrieval still uses ``F``)
+    * ``training`` -> ``(id_score, F, cloth_score, F', global_feat, map_id, map_cloth)``
+      where ``map_id`` / ``map_cloth`` are the attention-weighted maps **before
+      pooling** (``(B, 2048, H/16, W/16)``), available for other modules.
+    * ``eval``     -> ``F`` only (retrieval still uses ``F``)
 
-    ``feat_id`` is ``F`` (identity branch, ID + triplet loss), ``feat_cloth`` is
-    ``F'`` (clothing branch, ID-style softmax loss). ``global_feat`` is the plain
-    pooled backbone descriptor, kept for backward compatibility.
+    ``F`` is the identity branch (ID + triplet loss), ``F'`` the clothing branch
+    (clothing softmax). ``global_feat`` is the plain pooled backbone descriptor,
+    kept for backward compatibility.
     """
 
     def __init__(
@@ -109,11 +111,16 @@ class ResNet(nn.Module):
         x = self.base(x)
 
         if self.dual_branch:
-            feat_id_raw, feat_cloth_raw = self.channel_attention(x)
+            # channel attention first, pooling afterwards; the attention-weighted
+            # maps (still B,C,H,W) stay available to downstream modules
+            att = self.channel_attention(x)
+            feat_id_raw, feat_cloth_raw = att.feat_id, att.feat_cloth
+            map_id, map_cloth = att.map_id, att.map_cloth
         else:
             feat_id_raw = nn.functional.avg_pool2d(x, x.shape[2:4])
             feat_id_raw = feat_id_raw.view(feat_id_raw.shape[0], -1)
             feat_cloth_raw = None
+            map_id, map_cloth = None, None
 
         global_feat = nn.functional.avg_pool2d(x, x.shape[2:4])
         global_feat = global_feat.view(global_feat.shape[0], -1)
@@ -141,7 +148,12 @@ class ResNet(nn.Module):
             else:
                 cloth_feat, cloth_score = None, None
 
-            return cls_score, feat, cloth_score, cloth_feat, global_feat
+            # Training return, in order:
+            #   id_score, F, cloth_score, F', global_feat, map_id, map_cloth
+            # map_id / map_cloth are the attention-weighted maps BEFORE pooling,
+            # for any module that wants to work on the spatial features.
+            return (cls_score, feat, cloth_score, cloth_feat, global_feat,
+                    map_id, map_cloth)
         else:
             if self.neck_feat:
                 return feat

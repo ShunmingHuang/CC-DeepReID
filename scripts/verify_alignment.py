@@ -334,21 +334,38 @@ def verify_dual_branch(root):
     # ---- 1) the attention module itself ----
     att = DualBranchChannelAttention(channels=2048, reduction=16)
     fm = torch.randn(2, 2048, 8, 4)
-    F, Fp = att(fm)
+    out = att(fm)
+    check(len(out) == 4, 'attention returns 4 fields (F, F\', map_id, map_cloth)', len(out))
+    F, Fp, map_id, map_cloth = out
     check(F.shape == (2, 2048) and Fp.shape == (2, 2048),
           'attention returns two (B, 2048) features F and F\'', (tuple(F.shape), tuple(Fp.shape)))
     check(F.shape == Fp.shape, 'F and F\' have identical width (disentangle-ready)')
+    check(map_id.shape == (2, 2048, 8, 4) and map_cloth.shape == (2, 2048, 8, 4),
+          'maps come out un-pooled, same spatial size as the input',
+          (tuple(map_id.shape), tuple(map_cloth.shape)))
+
+    # attention is applied on the MAP; pooling is per-branch and comes after
+    check(torch.allclose(att.pool(map_id), F, atol=1e-5),
+          'GAP(map_id) == F (pooling happens after the channel attention)',
+          float((att.pool(map_id) - F).abs().max()))
+    check(torch.allclose(att.pool(map_cloth), Fp, atol=1e-5),
+          'GAP(map_cloth) == F\' (each branch has its OWN pooling)',
+          float((att.pool(map_cloth) - Fp).abs().max()))
 
     # the two branches must not be trivially identical
     att.eval()
     with torch.no_grad():
-        F, Fp = att(fm)
+        out_eval = att(fm)
+    F, Fp = out_eval.feat_id, out_eval.feat_cloth
     check(not torch.allclose(F, Fp), 'F and F\' come from independent branch parameters',
           float((F - Fp).abs().mean()))
+    check(not torch.allclose(out_eval.map_id, out_eval.map_cloth),
+          'the two branches re-weight the map differently')
 
     # channel attention must actually re-weight channels (weights not all equal)
-    w_id = att.att_id.fc(att._flatten(att.pool(fm)))
-    w_cl = att.att_cloth.fc(att._flatten(att.pool(fm)))
+    squeezed = fm.mean(dim=(2, 3))
+    w_id = att.att_id.fc(squeezed)
+    w_cl = att.att_cloth.fc(squeezed)
     check(w_id.std().item() > 0, 'id branch channel weights vary across channels',
           float(w_id.std()))
     check(not torch.allclose(w_id, w_cl), 'the two branches learn different channel weights')
@@ -387,8 +404,8 @@ def verify_dual_branch(root):
     model = make_model(c, num_classes=3, num_cloth_classes=6)
     model.train()
     out = model(torch.randn(4, 3, 256, 128))
-    check(len(out) == 5, 'train forward returns 5 outputs', len(out))
-    id_score, F, cloth_score, Fp, global_feat = out
+    check(len(out) == 7, 'train forward returns 7 outputs', len(out))
+    id_score, F, cloth_score, Fp, global_feat, map_id, map_cloth = out
     check(id_score.shape == (4, 3), 'F -> id logits (B, num_id)', tuple(id_score.shape))
     check(cloth_score.shape == (4, 6), 'F\' -> cloth logits (B, num_cloth)',
           tuple(cloth_score.shape))
@@ -396,6 +413,49 @@ def verify_dual_branch(root):
           'both branch features are (B, 2048)', (tuple(F.shape), tuple(Fp.shape)))
     check(torch.isfinite(id_score).all() and torch.isfinite(cloth_score).all(),
           'logits are finite')
+
+    # the attention-weighted maps must be exposed UN-POOLED (4D, spatial dims kept)
+    check(map_id is not None and map_cloth is not None,
+          'attention-weighted maps are returned')
+    check(map_id.dim() == 4 and map_cloth.dim() == 4,
+          'maps are 4D (channel attention before pooling, not after)',
+          (tuple(map_id.shape), tuple(map_cloth.shape)))
+    check(map_id.shape[1] == 2048 and map_id.shape[2] > 1 and map_id.shape[3] > 1,
+          'maps keep the spatial resolution (H/16, W/16)',
+          tuple(map_id.shape))
+    # Pooling the map must reproduce the PRE-NECK branch feature. With
+    # MODEL.NECK='bnneck' the model returns bottleneck(GAP(map)), so assert the
+    # whole chain rather than pretending GAP(map) == F.
+    pooled_id = map_id.detach().mean(dim=(2, 3))
+    check(torch.allclose(model.bottleneck(pooled_id), F, atol=1e-4),
+          'F == bottleneck(GAP(map_id))  (attention -> pool -> BNNeck)',
+          float((model.bottleneck(pooled_id) - F).abs().max()))
+
+    # ...and with a non-bnneck neck the model output IS the pooled map, which
+    # pins down "channel attention first, per-branch pooling afterwards"
+    c_noneck = c.clone()
+    c_noneck.merge_from_list(['MODEL.NECK', 'none'])
+    c_noneck.freeze()
+    m_noneck = make_model(c_noneck, num_classes=3, num_cloth_classes=6)
+    m_noneck.train()
+    o = m_noneck(torch.randn(4, 3, 256, 128),
+                 target_cloth=torch.tensor([0, 1, 2, 3, 4, 5]))
+    g_id = m_noneck.channel_attention.pool(o[5].detach())
+    g_cloth = m_noneck.channel_attention.pool(o[6].detach())
+    check(torch.allclose(g_id, o[1], atol=1e-4),
+          'GAP(map_id) == F  (channel attention first, pooling afterwards)',
+          float((g_id - o[1]).abs().max()))
+    check(torch.allclose(g_cloth, o[3], atol=1e-4),
+          'GAP(map_cloth) == F\' (each branch has its OWN pooling)',
+          float((g_cloth - o[3]).abs().max()))
+    check(not torch.allclose(map_id, map_cloth),
+          'the two branches produce different maps (independent attention + pooling)',
+          float((map_id - map_cloth).abs().mean()))
+
+    # pre-pool maps must sit on the gradient path of the pooled features
+    gmap = torch.autograd.grad(F.sum(), map_id, retain_graph=True, allow_unused=True)[0]
+    check(gmap is not None and gmap.abs().sum() > 0,
+          'map_id is on the autograd path of F (usable by other modules)')
 
     # eval forward must stay a single F tensor so the retrieval path is unchanged
     model.eval()
@@ -407,7 +467,7 @@ def verify_dual_branch(root):
     # ---- 4) losses: F gets ID+triplet, F\' gets ID-only, plus disentangle ----
     loss_func = make_loss(c, num_classes=3, num_cloth_classes=6)
     model.train()
-    id_score, F, cloth_score, Fp, _ = model(torch.randn(6, 3, 256, 128),
+    id_score, F, cloth_score, Fp, _, _, _ = model(torch.randn(6, 3, 256, 128),
                                             target_cloth=torch.tensor([0, 1, 2, 3, 4, 5]))
     check(cloth_score is not None and Fp is not None,
           'singleton cloth classes still produce a cloth branch (BN fallback, no crash)')
@@ -428,17 +488,25 @@ def verify_dual_branch(root):
     # F' is a *classification* branch: its head must be a label-smoothed softmax
     # over the clothing vocabulary, and it must carry NO triplet term.
     from losses.cross_entropy_loss import CrossEntropyLoss as _CE
-    from losses.cross_entropy_loss import CrossEntropyLoss as _CE2
     expected_cloth = float(_CE(num_classes=6, label_smooth=bool(c.MODEL.LABELSMOOTH),
                                use_gpu=True)(cloth_score.float(), target_cloth))
     check(abs(parts['cloth'] - expected_cloth) < 1e-5,
-          'cloth head loss == label-smoothed CE over the cloth vocabulary',
+          'cloth head loss == CE over the cloth vocabulary',
           (parts['cloth'], expected_cloth))
-    plain_cloth = float(_CE2(num_classes=6, label_smooth=False,
-                             use_gpu=True)(cloth_score.float(), target_cloth))
-    check(abs(parts['cloth'] - plain_cloth) > 1e-4,
-          'cloth head really uses smoothing (differs from unsmoothed CE)',
-          (parts['cloth'], plain_cloth))
+    # Check the label-smoothing FLAG rather than the loss value: at random init the
+    # CE is ~ln(num_classes) and smoothing perturbs it by only ~1e-5, so a value
+    # comparison cannot distinguish the two configurations.
+    check(loss_func.cloth_loss.eps > 0,
+          'cloth head is configured with label smoothing (MODEL.LABELSMOOTH)',
+          loss_func.cloth_loss.eps)
+    check(abs(loss_func.cloth_loss.eps - 0.1) < 1e-9,
+          'label smoothing strength is the standard 0.1', loss_func.cloth_loss.eps)
+    # and it must follow MODEL.LABELSMOOTH when that is turned off
+    c_nols = c.clone()
+    c_nols.merge_from_list(['MODEL.LABELSMOOTH', False])
+    c_nols.freeze()
+    check(make_loss(c_nols, num_classes=3, num_cloth_classes=6).cloth_loss.eps == 0,
+          'turning MODEL.LABELSMOOTH off also disables it on the cloth head')
 
     # ---- 4b) the triplet must equal CSCI's identity-only implementation ----
     # reference: ICCV-CSCI-Person-ReID/loss/triplet_loss.py (hard_example_mining
@@ -489,7 +557,7 @@ def verify_dual_branch(root):
         opt.zero_grad()
         # eval() returns only F, so run the branch heads manually for training
         model.train()
-        id_score, F, cloth_score, Fp, _ = model(x, target_cloth=cloth12)
+        id_score, F, cloth_score, Fp, _, _, _ = model(x, target_cloth=cloth12)
         model.eval()
         loss, _ = loss_func(id_score, F, target12, cloth12,
                             cloth_score=cloth_score, cloth_feat=Fp, return_parts=True)
@@ -507,8 +575,10 @@ def verify_dual_branch(root):
     plain = make_model(c2, num_classes=3, num_cloth_classes=6)
     plain.train()
     out = plain(torch.randn(4, 3, 256, 128))
-    check(len(out) == 5 and out[2] is None,
-          'dual_branch=False keeps the legacy path (no cloth head)', len(out))
+    # the tuple shape is kept identical across modes; the dual-branch extras are None
+    check(len(out) == 7 and out[2] is None and out[5] is None and out[6] is None,
+          'dual_branch=False keeps the legacy path (no cloth head, no maps)',
+          [None if x is None else getattr(x, 'shape', type(x).__name__) for x in out])
     check(out[1].shape == (4, 2048), 'legacy F is still the plain pooled descriptor',
           tuple(out[1].shape))
 

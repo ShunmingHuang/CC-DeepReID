@@ -13,17 +13,38 @@ which knobs exist — so later experiments do not silently break the plumbing.
 
 ```
 image
-  └─ ResNet50 (last_stride=1)                    → (B, 2048, H/16, W/16)
-       └─ DualBranchChannelAttention              models/attention.py
-            ├─ shared GAP → SE branch 1 ────────→ F   (B, 2048)
-            └─ shared GAP → SE branch 2 ────────→ F'  (B, 2048)
+  └─ ResNet50 (last_stride=1)                        → (B, 2048, H/16, W/16)
+       └─ DualBranchChannelAttention                  models/attention.py
+            ├─ SE branch 1 (re-weights the map) ────→ map_id    (B, 2048, H/16, W/16)
+            │                                            └─ GAP → F   (B, 2048)
+            └─ SE branch 2 (re-weights the map) ────→ map_cloth (B, 2048, H/16, W/16)
+                                                         └─ GAP → F'  (B, 2048)
                  F  → BNNeck → classifier_id     → id logits
                  F' → BNNeck → classifier_cloth  → cloth logits
 ```
 
-Each `SE branch` is `Linear(C→C/r) → ReLU → Linear(C/r→C) → Sigmoid` applied as
-per-channel weights on the feature map, followed by GAP. The branches have
-**independent parameters**, so they can specialise.
+**Channel attention comes first, pooling comes after**, and **the pooling is
+per-branch** — each branch pools its own attention-weighted map:
+
+* `map_id` / `map_cloth` are the attention-weighted maps *before* pooling. They
+  are returned by the training forward so other modules can attach to the
+  spatial features; they sit on the autograd path of `F` / `F'`.
+* The SE gate needs a global pool *statistic* to compute its channel weights —
+  that is inherent to squeeze-and-excitation (the "squeeze") and is not the
+  pooling that produces `F` / `F'`.
+
+Each `SE branch` is `mean(C) → Linear(C→C/r) → ReLU → Linear(C/r→C) → Sigmoid`
+applied as per-channel weights on the spatial map. The branches have
+**independent attention parameters and independent pooling**, so they can
+specialise. `GAP(map_id) == F` (up to `MODEL.NECK`) and `GAP(map_cloth) == F'`
+are asserted in `scripts/verify_alignment.py`.
+
+Training forward returns, in order::
+
+    id_score, F, cloth_score, F', global_feat, map_id, map_cloth
+
+The tuple shape is identical when `MODEL.DUAL_BRANCH=False`; the dual-branch
+extras are then `None`.
 
 ### Loss
 

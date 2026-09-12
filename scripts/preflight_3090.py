@@ -109,7 +109,7 @@ def check_model_and_amp(cfg, device):
     torch.cuda.reset_peak_memory_stats(device)
     try:
         with torch.autocast(device_type='cuda', enabled=True):
-            cls_score, F, cloth_score, Fp, _ = model(x, target_cloth=target_cloth)
+            cls_score, F, cloth_score, Fp, _, _, _ = model(x, target_cloth=target_cloth)
             cls_score, F = cls_score.float(), F.float()
             if cloth_score is not None:
                 cloth_score = cloth_score.float()
@@ -287,7 +287,7 @@ def check_real_step(cfg, device):
             opt.zero_grad()
             img, pid, cloth_id = img.to(device), pid.to(device), cloth_id.to(device)
             with torch.autocast(device_type='cuda', enabled=True):
-                cls_score, F, cloth_score, Fp, _ = model(img, target_cloth=cloth_id)
+                cls_score, F, cloth_score, Fp, _, _, _ = model(img, target_cloth=cloth_id)
                 cls_score, F = cls_score.float(), F.float()
                 if cloth_score is not None:
                     cloth_score = cloth_score.float()

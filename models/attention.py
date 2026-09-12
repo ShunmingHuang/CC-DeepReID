@@ -1,22 +1,40 @@
 """Dual-branch channel attention for the CC-DeepReID backbone.
 
-The module sits right behind the ResNet50 feature map and splits the pooled
-descriptor into two channels-attended branches:
+The module sits right behind the ResNet50 feature map and splits it into two
+channel-attended branches. **The channel attention is applied on the spatial
+feature map and the spatial pooling happens afterwards**, so the
+attention-weighted maps ``map_id`` / ``map_cloth`` are exposed and can be
+consumed by other modules before ``F`` / ``F'`` are pooled out of them::
 
-* branch 1 -> ``F``   : identity branch, supervised by ID + triplet (and used at
-  test time, so the retrieval protocol is unchanged);
-* branch 2 -> ``F'``  : clothing branch, supervised by an ID-style softmax over
-  the clothing vocabulary.
+    feat_map (B, C, H, W)
+      ├─ branch 1: SE re-weight on the map -> map_id    (B, C, H, W) --GAP--> F
+      └─ branch 2: SE re-weight on the map -> map_cloth (B, C, H, W) --GAP--> F'
 
-``F`` and ``F'`` are additionally pushed towards orthogonality by
-``ClothDisentangleLoss`` (CSCI's ``Cosine_Disentangle``).
+``F`` feeds the identity branch (ID + triplet loss, used at test time), ``F'``
+feeds the clothing branch (clothing softmax). ``F`` and ``F'`` are pushed apart
+by ``ClothDisentangleLoss`` (CSCI's ``Cosine_Disentangle``).
+
+Note on the SE gate: squeeze-and-excitation derives its channel weights from a
+global average pool *statistic* -- that is inherent to the mechanism (it is the
+"squeeze"), and it is not the pooling that produces ``F`` / ``F'``. The maps
+handed back below are the un-pooled tensors, i.e. what downstream modules can
+attach to.
 """
+
+from collections import namedtuple
 
 import torch
 import torch.nn as nn
 
-
 MIN_BOTTLENECK_DIM = 16
+
+#: Return type of :meth:`DualBranchChannelAttention.forward`.
+#:
+#: * ``feat_id`` / ``feat_cloth`` -- pooled descriptors ``F`` / ``F'``
+#: * ``map_id`` / ``map_cloth``    -- attention-weighted maps *before* pooling
+DualBranchOutput = namedtuple(
+    'DualBranchOutput',
+    ['feat_id', 'feat_cloth', 'map_id', 'map_cloth'])
 
 
 def _bottleneck_dim(channels, reduction):
@@ -25,7 +43,12 @@ def _bottleneck_dim(channels, reduction):
 
 
 class BranchChannelAttention(nn.Module):
-    """SE-style channel attention: shared pooling, per-branch squeeze-excite."""
+    """SE-style channel attention applied to a spatial map.
+
+    The excitation weights come from the global average pool statistic (that is
+    what SE *is*); the **output stays spatial**:
+    ``(B, C, H, W) * sigmoid(gate)``.
+    """
 
     def __init__(self, channels, reduction=16):
         super(BranchChannelAttention, self).__init__()
@@ -37,14 +60,17 @@ class BranchChannelAttention(nn.Module):
             nn.Sigmoid(),
         )
 
-    def forward(self, pooled, spatial):
-        """pooled: (B, C) global average pooling; spatial: (B, C, H, W)."""
-        weight = self.fc(pooled).unsqueeze(-1).unsqueeze(-1)
-        return spatial * weight
+    def forward(self, feat_map):
+        """feat_map: (B, C, H, W) -> channel-attended map, still (B, C, H, W)."""
+        # squeeze: exists only to produce the excitation weights
+        squeezed = feat_map.mean(dim=(2, 3))
+        weight = self.fc(squeezed).unsqueeze(-1).unsqueeze(-1)
+        # excite: re-weight the spatial map (no pooling on the output path)
+        return feat_map * weight
 
 
 class DualBranchChannelAttention(nn.Module):
-    """Two channel-attention branches producing features ``F`` and ``F'``.
+    """Two channel-attention branches producing ``F`` / ``F'`` and their maps.
 
     Args:
         channels: backbone output channels (2048 for ResNet50).
@@ -61,7 +87,6 @@ class DualBranchChannelAttention(nn.Module):
         self.channels = channels
         self.cloth_feat_dim = channels if cloth_feat_dim is None else cloth_feat_dim
 
-        self.pool = nn.AdaptiveAvgPool2d(1)
         self.att_id = BranchChannelAttention(channels, reduction)
         self.att_cloth = BranchChannelAttention(channels, reduction)
 
@@ -75,19 +100,25 @@ class DualBranchChannelAttention(nn.Module):
     def _flatten(x):
         return x.view(x.shape[0], -1)
 
+    def forward_maps(self, feat_map):
+        """Attention-weighted maps, before any pooling: ``(B, C, H, W)`` each."""
+        return self.att_id(feat_map), self.att_cloth(feat_map)
+
+    def pool(self, feat_map):
+        """Global average pooling + flatten: ``(B, C, H, W) -> (B, C)``."""
+        return self._flatten(
+            nn.functional.avg_pool2d(feat_map, feat_map.shape[2:4]))
+
     def forward(self, feat_map):
-        """feat_map: (B, C, H, W) -> (F, F') both shaped (B, feat_dim)."""
-        pooled = self._flatten(self.pool(feat_map))
+        """Returns :class:`DualBranchOutput` (pooled features + pre-pool maps)."""
+        map_id, map_cloth = self.forward_maps(feat_map)
 
-        id_map = self.att_id(pooled, feat_map)
-        cloth_map = self.att_cloth(pooled, feat_map)
-
-        feat_id = self._flatten(self.pool(id_map))
-        feat_cloth = self._flatten(self.pool(cloth_map))
+        feat_id = self.pool(map_id)
+        feat_cloth = self.pool(map_cloth)
 
         if self.projector:
             feat_cloth = self.cloth_fc(self.cloth_bn(feat_cloth))
             if not self.training:
                 feat_cloth = self.cloth_bn(feat_cloth)
 
-        return feat_id, feat_cloth
+        return DualBranchOutput(feat_id, feat_cloth, map_id, map_cloth)

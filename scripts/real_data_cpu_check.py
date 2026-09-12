@@ -88,7 +88,7 @@ def main():
     for img, pid, cam, cloth_id in loader:
         opt.zero_grad()
         target, target_cloth = pid, cloth_id
-        cls_score, F, cloth_score, Fp, _ = model(img, target_cloth=target_cloth)
+        cls_score, F, cloth_score, Fp, _, _, _ = model(img, target_cloth=target_cloth)
         cls_score, F = cls_score.float(), F.float()
         if cloth_score is not None:
             cloth_score = cloth_score.float()

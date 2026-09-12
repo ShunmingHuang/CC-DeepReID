@@ -165,8 +165,9 @@ def do_train(
             target_cloth_id = cloth_id.to(device)
 
             with torch.autocast(device_type=device_type, enabled=(device_type == "cuda")):
-                # dual-branch model: F (id), F' (cloth) + the plain pooled feature
-                cls_score, feat, cloth_score, cloth_feat, _ = model(
+                # dual-branch model: F (id), F' (cloth), plain pooled feature and
+                # the attention-weighted maps before pooling (for other modules)
+                cls_score, feat, cloth_score, cloth_feat, _, _, _ = model(
                     img, target_cloth=target_cloth_id)
                 # Convert to float32 for loss computation
                 cls_score = cls_score.float()
