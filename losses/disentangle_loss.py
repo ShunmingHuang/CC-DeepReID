@@ -1,9 +1,30 @@
-"""Clothing / identity feature disentanglement loss.
+"""Identity / identity-independent feature disentanglement loss.
 
 Mirrors ``Cosine_Disentangle`` in ICCV-CSCI-Person-ReID/loss/custom_loss.py:
-the cosine similarity between the identity feature ``F`` and the clothing
-feature ``F'`` is driven to zero, i.e. the two descriptors are made orthogonal
-("尽量远离").
+the cosine similarity between the identity feature ``F`` and the
+identity-independent feature ``F'`` is driven to zero, i.e. the two descriptors
+are made orthogonal ("尽量远离").
+
+WHAT THIS DOES AND DOES NOT DO
+------------------------------
+This is a **geometric** constraint, not an information-theoretic one. It bounds
+``E[<F, F'>]`` only. Measured on a controlled setup (F supervised by identity,
+F' by clothing, both read off the same input):
+
+    |cos(F, F')|              6.6%  ->  1.0%     (the loss works)
+    identity probe on F'     30.6%  -> 28.6%     (information barely moves)
+    clothing probe on F      29.9%  -> 23.2%
+    clothing accuracy on F'  56.4%  -> 40.6%     (the loss has a cost)
+
+So two branches can be mutually orthogonal while each still carries the other's
+factor (the encoders are non-linear, so per-dimension correlation is untouched),
+and the constraint does not come for free. It is also achieved quickly: once
+``|cos| -> 0`` the term contributes no gradient, so it only acts early in
+training.
+
+If genuine *information* separation is needed, orthogonality alone is not the
+tool -- use an adversarial (gradient-reversed) identity predictor on ``F'``, or
+change what supervises ``F'``.
 """
 
 import torch

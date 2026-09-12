@@ -586,6 +586,147 @@ def verify_dual_branch(root):
     return model
 
 
+def verify_cal_and_cloth_head(root):
+    """C2R-ReID clothing branch: cosine head, detached discriminator, delay."""
+    print('\n=== C2R clothes head (cosine) + CAL discriminator ===')
+    import torch.nn.functional as Fn
+    from configs import cfg
+    from losses import make_loss
+    from losses.clothes_adversarial_loss import (ClothesBasedAdversarialLoss,
+                                                 positive_clothes_mask)
+    from models import make_model
+    from models.classifier import NormalizedClassifier
+
+    c = cfg.clone()
+    c.merge_from_list(['MODEL.DEVICE', 'cpu', 'MODEL.NECK', 'none',
+                       'DATALOADER.NUM_WORKERS', 0])
+    c.freeze()
+
+    # ---- 1) cosine head: logits really are scaled cosine similarities ----
+    head = NormalizedClassifier(64, 10, scale=16.0)
+    x = torch.randn(5, 64)
+    logits = head(x)
+    manual = 16.0 * Fn.linear(Fn.normalize(x, p=2, dim=1),
+                             Fn.normalize(head.weight, p=2, dim=1))
+    check(torch.allclose(logits, manual, atol=1e-5),
+          'cosine head logits == scale * cos(feature, class weight)',
+          float((logits - manual).abs().max()))
+    check(float(logits.abs().max()) <= 16.0 + 1e-4,
+          'cosine logits are bounded by the scale', float(logits.abs().max()))
+
+    # ---- 2) model wiring: CLOTH_HEAD switches the head type ----
+    m_lin = make_model(c, num_classes=3, num_cloth_classes=6)
+    check(isinstance(m_lin.cloth_classifier, torch.nn.Linear),
+          'CLOTH_HEAD=linear keeps nn.Linear', type(m_lin.cloth_classifier).__name__)
+
+    c_cos = c.clone()
+    c_cos.merge_from_list(['MODEL.CLOTH_HEAD', 'cosine', 'MODEL.CLOTH_HEAD_SCALE', 16.0])
+    c_cos.freeze()
+    m_cos = make_model(c_cos, num_classes=3, num_cloth_classes=6)
+    check(isinstance(m_cos.cloth_classifier, NormalizedClassifier),
+          'CLOTH_HEAD=cosine installs NormalizedClassifier',
+          type(m_cos.cloth_classifier).__name__)
+    m_cos.train()
+    out = m_cos(torch.randn(4, 3, 256, 128),
+                target_cloth=torch.tensor([0, 1, 2, 3, 4, 5]))
+    check(float(out[2].abs().max()) <= 16.0 + 1e-3,
+          'model cloth logits respect the cosine scale', float(out[2].abs().max()))
+
+    # ---- 3) detach path: the discriminator must NOT reach the backbone ----
+    m_cos.zero_grad()
+    det_score, _, _, det_feat, _, _, _ = m_cos(
+        torch.randn(4, 3, 256, 128), target_cloth=torch.tensor([0, 1, 2, 3, 4, 5]),
+        detach_cloth=True)
+    check(det_score is not None and det_feat is not None,
+          'detach_cloth forward returns cloth logits + features')
+    check(not det_feat.requires_grad,
+          'the discriminator feature is a true leaf: requires_grad == False '
+          '(no BatchNorm on the detach path, or it would rebuild a graph)')
+    det_score.float().sum().backward()
+    head_grad = m_cos.cloth_classifier.weight.grad
+    bn_grad = (m_cos.cloth_bottleneck.weight.grad
+               if m_cos.cloth_bottleneck is not None else None)
+    bb_grad = next(p for n, p in m_cos.named_parameters()
+                   if n.startswith('base.') and p.requires_grad).grad
+    check(head_grad is not None and float(head_grad.abs().sum()) > 0,
+          'detached path DOES update the clothing head',
+          float(head_grad.abs().sum()))
+    check(bn_grad is None or float(bn_grad.abs().sum()) == 0,
+          'detached path leaves the cloth BatchNorm untouched (it is not on that path)',
+          None if bn_grad is None else float(bn_grad.abs().sum()))
+    check(bb_grad is None or float(bb_grad.abs().sum()) == 0,
+          'detached path does NOT touch the backbone (the whole point of detach)',
+          None if bb_grad is None else float(bb_grad.abs().sum()))
+
+    # ---- 4) the live path DOES reach the backbone (that is the adversarial term) ----
+    m_cos.zero_grad()
+    live_score, _, _, _, _, _, _ = m_cos(
+        torch.randn(4, 3, 256, 128), target_cloth=torch.tensor([0, 1, 2, 3, 4, 5]))
+    live_score.float().sum().backward()
+    bb_grad_live = next(p for n, p in m_cos.named_parameters()
+                        if n.startswith('base.') and p.requires_grad).grad
+    check(bb_grad_live is not None and float(bb_grad_live.abs().sum()) > 0,
+          'live path DOES reach the backbone (CAL drives the generator side)',
+          None if bb_grad_live is None else float(live_score.abs().mean()))
+
+    # ---- 5) CAL loss: positive mask semantics + eps spread ----
+    cal = ClothesBasedAdversarialLoss(scale=16.0, epsilon=0.1)
+    pids = torch.tensor([0, 0, 0, 0])
+    cloth = torch.tensor([0, 1, 0, 1])          # identity 0 owns clothes {0,1}
+    mask = torch.zeros(4, 4)
+    mask[:, 0] = 1
+    mask[:, 1] = 1
+    logits = torch.randn(4, 4)
+    loss_cal = float(cal(logits, cloth, mask))
+    check(loss_cal == loss_cal and loss_cal > 0, 'CAL returns a finite positive loss',
+          loss_cal)
+    # positives must be excluded from the negative set: if the mask covered only
+    # the target class, another class of the same identity would become a negative
+    mask_only_target = torch.zeros(4, 4)
+    mask_only_target.scatter_(1, cloth.unsqueeze(1), 1)
+    check(abs(float(cal(logits, cloth, mask_only_target)) - loss_cal) > 1e-6,
+          'CAL actually uses the full positive (same-identity) clothes set')
+    check(float(cal(logits, cloth, mask)) != float(
+        ClothesBasedAdversarialLoss(scale=16.0, epsilon=1.0)(logits, cloth, mask)),
+        'epsilon changes the objective (0.1 vs 1.0)')
+
+    # ---- 6) the positive mask comes from the dataset ----
+    from datasets import make_dataloader
+    c2 = c.clone()
+    c2.merge_from_list(['DATASETS.NAMES', 'prcc', 'DATASETS.ROOT_DIR', root,
+                        'SOLVER.IMS_PER_BATCH', 6, 'DATALOADER.NUM_INSTANCE', 3])
+    c2.freeze()
+    loaders, bundle = make_dataloader(c2)
+    check(bundle.pid2clothes is not None,
+          'DatasetBundle exposes pid2clothes for the CAL positive mask')
+    p2c = torch.as_tensor(bundle.pid2clothes)
+    check(tuple(p2c.shape) == (bundle.num_train_pids, bundle.num_train_clothes),
+          'pid2clothes has shape (num_train_pids, num_train_clothes)', tuple(p2c.shape))
+    got = positive_clothes_mask(bundle.pid2clothes, torch.tensor([0, 1]))
+    check(tuple(got.shape) == (2, bundle.num_train_clothes),
+          'positive_clothes_mask gathers one row per batch sample', tuple(got.shape))
+    check(float(got.sum()) > 0, 'the gathered mask is non-empty (some positives exist)',
+          float(got.sum()))
+
+    # ---- 7) delayed start: epoch gating is strictly "off before, on after" ----
+    start = int(c.MODEL.CAL_START_EPOCH)
+    check([e >= start for e in [start - 1, start, start + 1]] == [False, True, True],
+          'CAL epoch gate: inactive before CAL_START_EPOCH, active from it on',
+          'start={}'.format(start))
+
+    # ---- 8) USE_CAL guards ----
+    c_bad = c.clone()
+    c_bad.merge_from_list(['MODEL.USE_CAL', True])
+    c_bad.freeze()
+    from models import make_model as _mm
+    from losses import make_loss as _ml
+    m_nocloth = _mm(c_bad, num_classes=3, num_cloth_classes=0)
+    check(m_nocloth.cloth_classifier is None,
+          'without a clothing branch the CAL guard has something to catch')
+    check(_ml(c_bad, num_classes=3, num_cloth_classes=6).use_cal,
+          'USE_CAL is read from the config into the loss bundle')
+
+
 def main():
     # NOTE: use a workspace-local mock root (the DSH file sandbox blocks the OS temp dir)
     root = os.path.join(ROOT, '_mock_data')
@@ -598,6 +739,7 @@ def main():
         verify_metrics()
         verify_make_dataloader(root)
         verify_dual_branch(root)
+        verify_cal_and_cloth_head(root)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

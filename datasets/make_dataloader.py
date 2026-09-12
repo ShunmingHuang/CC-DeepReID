@@ -43,6 +43,12 @@ class DatasetBundle(object):
         self.num_query_imgs = getattr(dataset, 'num_query_imgs', len(self.query or []))
         self.num_gallery_imgs = len(self.gallery)
 
+        # (num_train_pids, num_train_clothes) binary mask: 1 where a training
+        # identity owns a clothing class. This is the positive mask C2R-ReID's
+        # clothes-based adversarial loss needs; it is indexed by the *relabelled*
+        # pid that the train tuples carry.
+        self.pid2clothes = getattr(dataset, 'pid2clothes', None)
+
     def __repr__(self):
         return ("DatasetBundle(name={}, train={}, query_diff={}, query_same={}, "
                 "query={}, gallery={})".format(

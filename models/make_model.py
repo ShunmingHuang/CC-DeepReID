@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .backbones import resnet50
 from .attention import DualBranchChannelAttention
+from .classifier import build_classifier
 
 def weights_init_kaiming(m):
     classname = m.__class__.__name__
@@ -36,9 +37,11 @@ class ResNet(nn.Module):
       pooling** (``(B, 2048, H/16, W/16)``), available for other modules.
     * ``eval``     -> ``F`` only (retrieval still uses ``F``)
 
-    ``F`` is the identity branch (ID + triplet loss), ``F'`` the clothing branch
-    (clothing softmax). ``global_feat`` is the plain pooled backbone descriptor,
-    kept for backward compatibility.
+    ``F`` is the identity branch (ID + triplet loss). ``F'`` is the
+    **identity-independent** branch: clothing classification is only the
+    supervision currently attached to it, not its definition; further modules are
+    meant to attach to that branch. ``global_feat`` is the plain pooled backbone
+    descriptor, kept for backward compatibility.
     """
 
     def __init__(
@@ -79,13 +82,21 @@ class ResNet(nn.Module):
         self.classifier.apply(weights_init_classifier)
 
         # ---- clothing branch head (F' -> cloth logits) ----
+        # The head type is config-driven: 'linear' keeps the original dot-product
+        # head, 'cosine' installs C2R-ReID's NormalizedClassifier (weight-normalised
+        # cosine logits), which suits the long-tailed clothing classes better.
         self.num_cloth_classes = num_cloth_classes or 0
+        self.cloth_head_mode = getattr(cfg.MODEL, 'CLOTH_HEAD', 'linear')
+        self.cloth_head_scale = getattr(cfg.MODEL, 'CLOTH_HEAD_SCALE', 16.0)
         if self.dual_branch and self.num_cloth_classes > 0:
             self.cloth_bottleneck = nn.BatchNorm1d(feat_dim)
             self.cloth_bottleneck.bias.requires_grad_(False)
             self.cloth_bottleneck.apply(weights_init_kaiming)
-            self.cloth_classifier = nn.Linear(feat_dim, self.num_cloth_classes, bias=False)
-            self.cloth_classifier.apply(weights_init_classifier)
+            self.cloth_classifier = build_classifier(
+                feat_dim, self.num_cloth_classes,
+                mode=self.cloth_head_mode, scale=self.cloth_head_scale)
+            if isinstance(self.cloth_classifier, nn.Linear):
+                self.cloth_classifier.apply(weights_init_classifier)
         else:
             self.cloth_bottleneck = None
             self.cloth_classifier = None
@@ -107,7 +118,7 @@ class ResNet(nn.Module):
         counts = torch.bincount(target_cloth.detach().view(-1))
         return bool(counts.numel() == 0 or counts.min().item() >= 2)
 
-    def forward(self, x, target_cloth=None):
+    def forward(self, x, target_cloth=None, detach_cloth=False):
         x = self.base(x)
 
         if self.dual_branch:
@@ -121,6 +132,18 @@ class ResNet(nn.Module):
             feat_id_raw = feat_id_raw.view(feat_id_raw.shape[0], -1)
             feat_cloth_raw = None
             map_id, map_cloth = None, None
+
+        if detach_cloth and feat_cloth_raw is not None:
+            # C2R-ReID's discriminator path. The gradient must not reach the
+            # backbone: detach the attention-weighted map AND keep the head free of
+            # any parameterised normalisation, otherwise the norms' own weights
+            # create a fresh grad_fn and this stops being a "frozen feature" probe.
+            detached = self.channel_attention.pool(map_cloth.detach())
+            cloth_score = (self.cloth_classifier(detached)
+                           if self.cloth_classifier is not None else None)
+            global_feat = nn.functional.avg_pool2d(x, x.shape[2:4])
+            global_feat = global_feat.view(global_feat.shape[0], -1)
+            return cloth_score, None, None, detached, global_feat, None, None
 
         global_feat = nn.functional.avg_pool2d(x, x.shape[2:4])
         global_feat = global_feat.view(global_feat.shape[0], -1)

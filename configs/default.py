@@ -32,6 +32,24 @@ cfg.MODEL.CLOTH_LOSS_WEIGHT = 1.0     # weight of the F' clothing softmax
 cfg.MODEL.DISENTANGLE_WEIGHT = 1.0    # weight of the F / F' separation term
 cfg.MODEL.DISENTANGLE_MARGIN = None   # None -> |cos| (CSCI); float -> hinge
 
+# ---- clothing classification head ----
+# 'linear' : plain dot-product head (original CC-DeepReID)
+# 'cosine' : C2R-ReID's NormalizedClassifier -- L2-normalised features AND class
+#            weights, so the logits are cosine similarities
+cfg.MODEL.CLOTH_HEAD = 'linear'
+cfg.MODEL.CLOTH_HEAD_SCALE = 16.0     # only used when CLOTH_HEAD == 'cosine'
+
+# ---- C2R-ReID clothes-based adversarial loss (CAL) ----
+# The clothing discriminator is trained on DETACHED features with its own
+# optimizer, and only from MODEL.CAL_START_EPOCH onwards; the backbone sees the
+# same loss through live (non-detached) features.
+cfg.MODEL.USE_CAL = False
+cfg.MODEL.CAL_WEIGHT = 1.0
+cfg.MODEL.CAL_SCALE = 16.0
+cfg.MODEL.CAL_EPSILON = 0.1
+cfg.MODEL.CAL_START_EPOCH = 25        # 1-based epoch at which CAL switches on
+cfg.MODEL.CAL_LR = 3.5e-4             # lr of the discriminator's own optimizer
+
 
 # -----------------------------------------------------------------------------
 # INPUT

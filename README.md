@@ -23,6 +23,14 @@ image
                  F' → BNNeck → classifier_cloth  → cloth logits
 ```
 
+> **Naming.** `F` is the **identity** branch. `F'` is the **identity-independent**
+> branch — it exists to carry whatever is *not* the person's identity, and
+> clothing classification is only the supervision currently attached to it
+> (`CLOTH_HEAD`, optional `CAL`). Read every `cloth*` identifier as "the module
+> currently hanging off the identity-independent branch", not as the branch's
+> definition: further modules will be attached there, and `map_cloth` is exposed
+> precisely so they can consume the un-pooled spatial features.
+
 **Channel attention comes first, pooling comes after**, and **the pooling is
 per-branch** — each branch pools its own attention-weighted map:
 
@@ -164,6 +172,47 @@ Model (`MODEL.*`):
 | `DISENTANGLE_MARGIN` | `None` | `None` → `\|cos\|` (CSCI); float → hinge |
 | `NO_MARGIN` | `False` | triplet margin = 0 when `True` |
 | `LABELSMOOTH` | `True` | label smoothing for both softmax heads |
+| `CLOTH_HEAD` | `linear` | `linear` = dot-product head; `cosine` = C2R-ReID's `NormalizedClassifier` |
+| `CLOTH_HEAD_SCALE` | `16.0` | logit scale, used only by the cosine head |
+| `USE_CAL` | `False` | enable C2R's clothes-based adversarial loss |
+| `CAL_WEIGHT` | `1.0` | weight of the adversarial term the backbone optimises |
+| `CAL_SCALE` / `CAL_EPSILON` | `16.0` / `0.1` | CAL temperature / positive-class spread |
+| `CAL_START_EPOCH` | `25` | **1-based epoch at which CAL switches on** |
+| `CAL_LR` | `3.5e-4` | learning rate of the discriminator's own optimizer |
+
+### C2R-ReID clothes branch (optional)
+
+Two independent switches, both off by default.
+
+**1. `MODEL.CLOTH_HEAD='cosine'`** — replaces `F'`'s dot-product classifier with
+C2R's `NormalizedClassifier` (`models/classifier.py`): the feature *and* the class
+weights are L2-normalised, so the logits are `scale * cos(...)`. Motivated by the
+long-tailed clothing classes (LTCC: 1..14 outfits per identity).
+
+**2. `MODEL.USE_CAL=True`** — adds C2R's clothes-based adversarial loss (CAL). The
+**same** clothing head is used twice per iteration, on two different graphs:
+
+```
+backbone step : cloth_score = head(bottleneck(F'))               # LIVE   -> CAL -> loss
+discriminator : cloth_score = head(pool(map_cloth.detach()))     # FROZEN -> CAL -> optimizer_cc
+```
+
+* the discriminator has its **own optimizer** and runs **after** the backbone
+  step, so its gradient never reaches the backbone;
+* the discriminator path deliberately **skips `cloth_bottleneck`** — a
+  parameterised normalisation there would build its own `grad_fn` and the branch
+  would stop being a pure "frozen feature" probe;
+* both are gated by `MODEL.CAL_START_EPOCH`: before it, neither the discriminator
+  nor the adversarial term runs (C2R's `START_EPOCH_CC`/`START_EPOCH_ADV`);
+* the positive mask is C2R's `pid2clothes[pids]` — every clothing class owned by
+  the anchor's identity. `DatasetBundle` exposes it as
+  `(num_train_pids, num_train_clothes)`, built by the dataset classes.
+
+> The adversarial term is **not** an attribute-removal loss. It is a weighted
+> negative log-likelihood that spreads probability over the identity's *own*
+> outfits, and the backbone **minimises** it. Whether that makes the backbone
+> clothes-agnostic is an empirical question, not a consequence of the code — see
+> the note in `losses/clothes_adversarial_loss.py`.
 
 `MODEL.PRETRAIN` exists in the config but is **not used by the training code**
 (`train.py`/`make_model` never call `load_parameter`). The backbone is trained

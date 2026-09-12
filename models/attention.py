@@ -10,9 +10,14 @@ consumed by other modules before ``F`` / ``F'`` are pooled out of them::
       ├─ branch 1: SE re-weight on the map -> map_id    (B, C, H, W) --GAP--> F
       └─ branch 2: SE re-weight on the map -> map_cloth (B, C, H, W) --GAP--> F'
 
-``F`` feeds the identity branch (ID + triplet loss, used at test time), ``F'``
-feeds the clothing branch (clothing softmax). ``F`` and ``F'`` are pushed apart
-by ``ClothDisentangleLoss`` (CSCI's ``Cosine_Disentangle``).
+``F`` is the **identity** branch (ID + triplet loss, used at test time).
+``F'`` is the **identity-independent** branch: it is meant to carry everything
+that is *not* the person's identity, and clothing classification is merely the
+supervision currently attached to it. Do not treat "clothing" as the definition
+of that branch -- further modules go there later.
+
+``F`` and ``F'`` are pushed apart by ``ClothDisentangleLoss`` (CSCI's
+``Cosine_Disentangle``).
 
 Note on the SE gate: squeeze-and-excitation derives its channel weights from a
 global average pool *statistic* -- that is inherent to the mechanism (it is the
@@ -71,6 +76,10 @@ class BranchChannelAttention(nn.Module):
 
 class DualBranchChannelAttention(nn.Module):
     """Two channel-attention branches producing ``F`` / ``F'`` and their maps.
+
+    ``F``       : identity branch.
+    ``F'``      : **identity-independent** branch. Clothing is only its current
+                  supervision; other modules attach here later.
 
     Args:
         channels: backbone output channels (2048 for ResNet50).

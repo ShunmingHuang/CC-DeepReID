@@ -7,6 +7,11 @@ Objective (per the CC-DeepReID dual-branch design)::
       + W_clo * CE_cloth(F')             # clothing softmax on F'
       + W_dis * Disentangle(F, F')       # push F and F' apart
 
+``F`` is the identity branch; ``F'`` is the **identity-independent** branch.
+Clothing classification is merely the supervision currently attached to ``F'``
+(plus the optional C2R ``CAL`` term) -- it is not the definition of that branch,
+and further modules are expected to be attached to it later.
+
 Alignment notes with ICCV-CSCI-Person-ReID (dataset layer only -- the loss layer
 is free to differ and does):
 
@@ -22,6 +27,7 @@ is free to differ and does):
 
 import torch.nn as nn
 
+from .clothes_adversarial_loss import ClothesBasedAdversarialLoss
 from .cross_entropy_loss import CrossEntropyLoss
 from .disentangle_loss import ClothDisentangleLoss
 from .hard_mine_triplet_loss import TripletLoss
@@ -64,8 +70,20 @@ class CombinedLoss(nn.Module):
         self.disentangle_loss = ClothDisentangleLoss(
             margin=getattr(cfg.MODEL, 'DISENTANGLE_MARGIN', None))
 
+        # ---- C2R-ReID clothes-based adversarial loss (optional) ----
+        self.use_cal = bool(getattr(cfg.MODEL, 'USE_CAL', False))
+        self.cal_weight = getattr(cfg.MODEL, 'CAL_WEIGHT', 1.0)
+        self.cal = ClothesBasedAdversarialLoss(
+            scale=getattr(cfg.MODEL, 'CAL_SCALE', 16.0),
+            epsilon=getattr(cfg.MODEL, 'CAL_EPSILON', 0.1))
+
+    def discriminator_loss(self, cloth_score_detached, target_cloth_id, positive_mask):
+        """CAL on DETACHED features: trains the clothing discriminator only."""
+        return self.cal(cloth_score_detached, target_cloth_id, positive_mask)
+
     def forward(self, id_score, id_feat, target, target_cloth_id=None,
-                cloth_score=None, cloth_feat=None, return_parts=False):
+                cloth_score=None, cloth_feat=None, positive_mask=None,
+                use_cal=False, return_parts=False):
         id_term = self.id_loss(inputs=id_score, targets=target)
         loss = self.id_weight * id_term
 
@@ -83,6 +101,12 @@ class CombinedLoss(nn.Module):
                                          targets=target_cloth_id)
             loss = loss + self.cloth_weight * cloth_term
 
+        adv_term = None
+        if use_cal and self.use_cal and cloth_score is not None and positive_mask is not None:
+            # CAL on LIVE features: this is the term the backbone optimises
+            adv_term = self.cal(cloth_score, target_cloth_id, positive_mask)
+            loss = loss + self.cal_weight * adv_term
+
         disentangle_term = None
         if cloth_feat is not None:
             disentangle_term = self.disentangle_loss(id_feat, cloth_feat)
@@ -92,7 +116,8 @@ class CombinedLoss(nn.Module):
             def _f(x):
                 return None if x is None else float(x.detach())
             return loss, {'id': _f(id_term), 'triplet': _f(triplet_term),
-                          'cloth': _f(cloth_term), 'disentangle': _f(disentangle_term)}
+                          'cloth': _f(cloth_term), 'adv': _f(adv_term),
+                          'disentangle': _f(disentangle_term)}
         return loss
 
 
