@@ -16,9 +16,10 @@ MODEL:
   NO_MARGIN: False
   LABELSMOOTH: True
   # ---- dual-branch channel attention behind the backbone ----
-  #  F  = id branch      : ID + triplet
-  #  F' = cloth branch   : ID-style softmax over the cloth vocabulary
-  #  F vs F'             : pushed apart (orthogonal)
+  #  F  = identity branch               : ID + triplet
+  #  F' = identity-independent branch   : currently supervised by the cloth
+  #       softmax (+ optional CAL / colour histogram); other modules go here later
+  #  F vs F'                            : pushed apart (orthogonal)
   DUAL_BRANCH: True
   ATT_REDUCTION: 16
   CLOTH_FEAT_DIM: -1        # -1 -> F' keeps 2048 dims (same width as F)
@@ -26,6 +27,37 @@ MODEL:
   CLOTH_LOSS_WEIGHT: 1.0
   DISENTANGLE_WEIGHT: 1.0
   DISENTANGLE_MARGIN: null  # null -> |cos| (CSCI); a float switches to a hinge
+
+  # ---- clothing classification head (on F') ----
+  #  'linear' : plain dot-product head
+  #  'cosine' : C2R-ReID's NormalizedClassifier (L2-normalised features AND
+  #             class weights, logits = CLOTH_HEAD_SCALE * cos)
+  CLOTH_HEAD: "linear"
+  CLOTH_HEAD_SCALE: 16.0
+
+  # ---- C2R-ReID clothes-based adversarial loss (CAL) ----
+  #  the clothing discriminator trains on DETACHED F' with its own optimizer,
+  #  starting at CAL_START_EPOCH; the backbone sees the same loss on live F'
+  USE_CAL: False
+  CAL_WEIGHT: 1.0
+  CAL_SCALE: 16.0
+  CAL_EPSILON: 0.1
+  CAL_START_EPOCH: 25       # 1-based epoch at which CAL switches on
+  CAL_LR: 3.5e-4
+
+  # ---- colour-histogram regression on F' (CSCI profile-44 recipe) ----
+  #  annotation-free target: RGB-uv histogram of the same augmented image.
+  #  Runs ALONGSIDE the cloth softmax, which is kept.
+  USE_HIST: False
+  HIST_DIM: 32              # bins per axis; label/head output length = HIST_DIM**2
+  HIST_HIDDEN: 1024
+  HIST_SIGMA: 0.001
+  HIST_INTENSITY_SCALE: False
+  HIST_NORM: "l1"           # 'l1' | 'l2' | null
+  HIST_NORM_P: 1
+  HIST_WEIGHT_SCALE: 100.0  # CSCI's wt
+  HIST_LOSS: "cosine"       # 'cosine' (1-|cos|) | 'mse' | 'l1'
+  HIST_LOSS_WEIGHT: 1.0
 
 # -----------------------------------------------------------------------------
 # INPUT
