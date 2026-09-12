@@ -179,6 +179,42 @@ Model (`MODEL.*`):
 | `CAL_SCALE` / `CAL_EPSILON` | `16.0` / `0.1` | CAL temperature / positive-class spread |
 | `CAL_START_EPOCH` | `25` | **1-based epoch at which CAL switches on** |
 | `CAL_LR` | `3.5e-4` | learning rate of the discriminator's own optimizer |
+| `USE_HIST` | `False` | add CSCI's colour-histogram regression on `F'` |
+| `HIST_DIM` | `32` | bins per axis; the label/prediction length is `HIST_DIM**2` |
+| `HIST_HIDDEN` | `1024` | hidden width of the regression head |
+| `HIST_SIGMA` | `0.001` | inverse-quadratic kernel width (CSCI profile 44) |
+| `HIST_INTENSITY_SCALE` | `False` | multiply counts by the RGB intensity norm |
+| `HIST_NORM` / `HIST_NORM_P` | `l1` / `1` | label normalisation |
+| `HIST_WEIGHT_SCALE` | `100.0` | multiply the label (CSCI's `wt`) |
+| `HIST_LOSS` | `cosine` | `cosine` (`1-\|cos\|`, CSCI 44) \| `mse` \| `l1` |
+| `HIST_LOSS_WEIGHT` | `1.0` | weight of the histogram term |
+
+### Colour-histogram supervision (optional, CSCI)
+
+`MODEL.USE_HIST=True` attaches a **second, annotation-free** supervision to `F'`,
+**alongside** the cloth softmax (which is kept unchanged):
+
+```
+augmented image ─┬─► backbone ─► F' ─► hist_head ─► hist_pred ─┐
+                 │                                             ├─► 1-|cos|
+                 └─► RGBuvHistBlock ─► L1 norm ×100 ─► label ───┘
+```
+
+* The target is an **RGB-uv histogram** (`datasets/histogram.py`, transcribed from
+  CSCI's `data/rgbuc.py`), computed from the *same augmented tensor* that feeds the
+  network -- no clothing label involved.
+* The block is **bit-identical to CSCI's** (verified to `~1e-9`); see
+  `scripts/verify_alignment.py`, which imports CSCI's class and compares directly.
+* Two behaviours of CSCI's implementation are reproduced deliberately rather than
+  "fixed", and both are easy to get wrong:
+  * `insz` is **never used** -- CSCI has no resize call, so the histogram is
+    computed at the image's native resolution;
+  * the `v` axis is not uniform across planes: plane 2 uses `log(I2/I1)`, i.e. `u`
+    and `v` share the same numerator channel. Making `v = log(I_a/I2)` everywhere
+    silently collapses plane 2 (`log(I2/I2) = 0`).
+* The block only supports **batch size 1** (CSCI fills sample 0 only); the loader
+  calls it per sample and it raises on `B > 1` instead of silently zeroing.
+* The cloth softmax keeps running next to it -- the two supervisions are additive.
 
 ### C2R-ReID clothes branch (optional)
 
@@ -204,6 +240,14 @@ discriminator : cloth_score = head(pool(map_cloth.detach()))     # FROZEN -> CAL
   would stop being a pure "frozen feature" probe;
 * both are gated by `MODEL.CAL_START_EPOCH`: before it, neither the discriminator
   nor the adversarial term runs (C2R's `START_EPOCH_CC`/`START_EPOCH_ADV`);
+* **`cloth_classifier` is excluded from the main optimizer** when `USE_CAL=True`
+  (`train.py` passes `exclude=['cloth_classifier']` to `build_optimizer`). In C2R
+  the clothes classifier is a separate module the main optimizer never sees; here
+  it is a submodule of the model, so it has to be removed explicitly -- otherwise
+  it is stepped twice per iteration and its effective lr is the sum of
+  `SOLVER.BASE_LR` and `CAL_LR`. Note the *backbone* still receives the cloth
+  softmax gradient (only the head's own weights are excluded), and `cloth_bottleneck`
+  is still in the main optimizer, exactly as `F'`'s normalisation is part of `F'`;
 * the positive mask is C2R's `pid2clothes[pids]` — every clothing class owned by
   the anchor's identity. `DatasetBundle` exposes it as
   `(num_train_pids, num_train_clothes)`, built by the dataset classes.

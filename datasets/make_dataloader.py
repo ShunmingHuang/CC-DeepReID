@@ -2,6 +2,7 @@ import torch
 import torchvision.transforms as T
 from torch.utils.data import DataLoader
 from .base import ImageDataset
+from .histogram import HistogramExtractor
 from timm.data.random_erasing import RandomErasing
 from .sampler import RandomIdentitySampler
 from .ltcc import ltcc
@@ -115,8 +116,25 @@ def make_dataloader(cfg):
     dataset = __factory[cfg.DATASETS.NAMES](root=cfg.DATASETS.ROOT_DIR)
     bundle = DatasetBundle(cfg.DATASETS.NAMES, dataset)
 
+    # ---------------- colour histogram label (CSCI's annotation-free target) ----
+    hist_extractor = None
+    if bool(getattr(cfg.MODEL, 'USE_HIST', False)):
+        hist_extractor = HistogramExtractor(
+            h=int(getattr(cfg.MODEL, 'HIST_DIM', 32)),
+            insz=getattr(cfg.MODEL, 'HIST_INSZ', 150),
+            sigma=float(getattr(cfg.MODEL, 'HIST_SIGMA', 0.001)),
+            intensity_scale=bool(getattr(cfg.MODEL, 'HIST_INTENSITY_SCALE', False)),
+            norm=getattr(cfg.MODEL, 'HIST_NORM', 'l1'),
+            norm_p=int(getattr(cfg.MODEL, 'HIST_NORM_P', 1)),
+            weight=float(getattr(cfg.MODEL, 'HIST_WEIGHT_SCALE', 100.0)),
+            pixel_mean=cfg.INPUT.PIXEL_MEAN, pixel_std=cfg.INPUT.PIXEL_STD,
+        )
+        print('colour histogram supervision ON: dim={} norm={} weight={}'.format(
+            hist_extractor.histblock.h, hist_extractor.norm, hist_extractor.weight))
+
     # ---------------- train ----------------
-    train_set = ImageDataset(dataset.train, train_transforms)
+    train_set = ImageDataset(dataset.train, train_transforms,
+                             hist_extractor=hist_extractor)
     if cfg.DATALOADER.SAMPLER == 'triplet':
         print('using triplet sampler')
         train_loader = DataLoader(
@@ -169,10 +187,18 @@ def make_dataloader(cfg):
 
 
 def train_collate_fn(batch):
-    imgs, pids, cams, clothes, _ = zip(*batch)
+    """4-tuple batches, plus the colour histogram when the samples carry one."""
+    if len(batch[0]) == 6:
+        imgs, pids, cams, clothes, _, hists = zip(*batch)
+        hists = torch.stack(hists, dim=0)
+    else:
+        imgs, pids, cams, clothes, _ = zip(*batch)
+        hists = None
     pids = torch.tensor(pids, dtype=torch.int64)
     cams = torch.tensor(cams, dtype=torch.int64)
     clothes = torch.tensor(clothes, dtype=torch.int64)
+    if hists is not None:
+        return torch.stack(imgs, dim=0), pids, cams, clothes, hists
     return torch.stack(imgs, dim=0), pids, cams, clothes
 
 

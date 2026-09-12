@@ -116,9 +116,19 @@ class BaseImageDataset(object):
 
 
 class ImageDataset(Dataset):
-    def __init__(self, dataset, transform=None):
+    """Wraps a list of ``(img_path, pid, cid, cloth_id)`` tuples.
+
+    When ``hist_extractor`` is given, the colour-histogram label (CSCI's
+    annotation-free supervision for the identity-independent branch) is computed
+    from the *same augmented tensor* that feeds the network, exactly like
+    ``ImageDataset_fixes.w_color`` in CSCI. It comes out as a 5th element, so the
+    default 4-tuple collate still works when it is disabled.
+    """
+
+    def __init__(self, dataset, transform=None, hist_extractor=None):
         self.dataset = dataset
         self.transform = transform
+        self.hist_extractor = hist_extractor
 
     def __len__(self):
         return len(self.dataset)
@@ -129,5 +139,10 @@ class ImageDataset(Dataset):
 
         if self.transform is not None:
             img = self.transform(img)
+
+        if self.hist_extractor is not None:
+            # the extractor only supports batch 1 (see datasets/histogram.py)
+            hist = self.hist_extractor(img.unsqueeze(0))[0]
+            return img, pid, cid, cloth_id, osp.basename(img_path), hist
 
         return img, pid, cid, cloth_id, osp.basename(img_path)

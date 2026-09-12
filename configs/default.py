@@ -50,6 +50,21 @@ cfg.MODEL.CAL_EPSILON = 0.1
 cfg.MODEL.CAL_START_EPOCH = 25        # 1-based epoch at which CAL switches on
 cfg.MODEL.CAL_LR = 3.5e-4             # lr of the discriminator's own optimizer
 
+# ---- colour-histogram regression on F' (CSCI's annotation-free supervision) ----
+# A second supervision that runs ALONGSIDE the cloth softmax (which is kept).
+# The target is an RGB-uv histogram computed from the same augmented image, so it
+# needs no label at all. Profile 44 in CSCI == histblock + L1 + wt=100 + cosine loss.
+cfg.MODEL.USE_HIST = False
+cfg.MODEL.HIST_DIM = 32               # bins per axis; label length is HIST_DIM**2
+cfg.MODEL.HIST_HIDDEN = 1024          # hidden width of the regression head
+cfg.MODEL.HIST_SIGMA = 0.001          # inverse-quadratic kernel width (CSCI 44)
+cfg.MODEL.HIST_INTENSITY_SCALE = False
+cfg.MODEL.HIST_NORM = 'l1'            # 'l1' | 'l2' | None
+cfg.MODEL.HIST_NORM_P = 1
+cfg.MODEL.HIST_WEIGHT_SCALE = 100.0   # multiply the label (CSCI's wt)
+cfg.MODEL.HIST_LOSS = 'cosine'        # 'cosine' (1-|cos|, CSCI 44) | 'mse' | 'l1'
+cfg.MODEL.HIST_LOSS_WEIGHT = 1.0
+
 
 # -----------------------------------------------------------------------------
 # INPUT

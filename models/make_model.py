@@ -32,9 +32,11 @@ class ResNet(nn.Module):
 
     Forward outputs:
 
-    * ``training`` -> ``(id_score, F, cloth_score, F', global_feat, map_id, map_cloth)``
+    * ``training`` -> ``(id_score, F, cloth_score, F', global_feat, map_id, map_cloth, hist_pred)``
       where ``map_id`` / ``map_cloth`` are the attention-weighted maps **before
-      pooling** (``(B, 2048, H/16, W/16)``), available for other modules.
+      pooling** (``(B, 2048, H/16, W/16)``), available for other modules, and
+      ``hist_pred`` is the colour-histogram regression off ``F'`` (``None`` when
+      ``MODEL.USE_HIST`` is off).
     * ``eval``     -> ``F`` only (retrieval still uses ``F``)
 
     ``F`` is the identity branch (ID + triplet loss). ``F'`` is the
@@ -101,6 +103,23 @@ class ResNet(nn.Module):
             self.cloth_bottleneck = None
             self.cloth_classifier = None
 
+        # ---- colour-histogram regression head (CSCI's annotation-free target) ----
+        # A second, *additional* supervision on the identity-independent branch:
+        # F' is regressed onto the RGB-uv histogram of the image. The cloth
+        # classifier above is untouched and keeps running alongside it.
+        self.use_hist = bool(getattr(cfg.MODEL, 'USE_HIST', False))
+        self.hist_dim = int(getattr(cfg.MODEL, 'HIST_DIM', 32)) ** 2
+        self.hist_hidden = int(getattr(cfg.MODEL, 'HIST_HIDDEN', 1024))
+        if self.dual_branch and self.use_hist:
+            self.hist_head = nn.Sequential(
+                nn.LayerNorm(feat_dim),
+                nn.Linear(feat_dim, self.hist_hidden),
+                nn.ReLU(inplace=True),
+                nn.Linear(self.hist_hidden, self.hist_dim),
+            )
+        else:
+            self.hist_head = None
+
     def load_parameter(self, trained_path):
         param_dict = torch.load(trained_path)
         if 'state_dict' in param_dict:
@@ -143,7 +162,7 @@ class ResNet(nn.Module):
                            if self.cloth_classifier is not None else None)
             global_feat = nn.functional.avg_pool2d(x, x.shape[2:4])
             global_feat = global_feat.view(global_feat.shape[0], -1)
-            return cloth_score, None, None, detached, global_feat, None, None
+            return cloth_score, None, None, detached, global_feat, None, None, None
 
         global_feat = nn.functional.avg_pool2d(x, x.shape[2:4])
         global_feat = global_feat.view(global_feat.shape[0], -1)
@@ -172,11 +191,14 @@ class ResNet(nn.Module):
                 cloth_feat, cloth_score = None, None
 
             # Training return, in order:
-            #   id_score, F, cloth_score, F', global_feat, map_id, map_cloth
+            #   id_score, F, cloth_score, F', global_feat, map_id, map_cloth, hist_pred
             # map_id / map_cloth are the attention-weighted maps BEFORE pooling,
             # for any module that wants to work on the spatial features.
+            # hist_pred is the colour-histogram regression off F' (None if disabled).
+            hist_pred = self.hist_head(feat_cloth_raw) if self.hist_head is not None \
+                else None
             return (cls_score, feat, cloth_score, cloth_feat, global_feat,
-                    map_id, map_cloth)
+                    map_id, map_cloth, hist_pred)
         else:
             if self.neck_feat:
                 return feat

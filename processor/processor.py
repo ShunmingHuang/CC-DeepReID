@@ -179,7 +179,12 @@ def do_train(
         cal_active = use_cal and epoch >= cal_start
         model.train()
 
-        for n_iter, (img, pid, _, cloth_id) in enumerate(train_loader):
+        for n_iter, batch in enumerate(train_loader):
+            # the train collate returns 4 items, plus the colour histogram when
+            # MODEL.USE_HIST is on
+            img, pid, _, cloth_id = batch[0], batch[1], batch[2], batch[3]
+            hist_target = batch[4] if len(batch) > 4 else None
+
             optimizer.zero_grad()
             if cal_active:
                 optimizer_cc.zero_grad()
@@ -187,6 +192,8 @@ def do_train(
             img = img.to(device)
             target = pid.to(device)
             target_cloth_id = cloth_id.to(device)
+            if hist_target is not None:
+                hist_target = hist_target.to(device)
 
             # positive mask: all clothing classes owned by each anchor's identity
             pos_mask = None
@@ -195,9 +202,9 @@ def do_train(
                     bundle.pid2clothes, target, device=device)
 
             with torch.autocast(device_type=device_type, enabled=(device_type == "cuda")):
-                # dual-branch model: F (id), F' (cloth), plain pooled feature and
-                # the attention-weighted maps before pooling (for other modules)
-                cls_score, feat, cloth_score, cloth_feat, _, _, _ = model(
+                # dual-branch model: F (id), F' (cloth), the un-pooled attention
+                # maps and the colour-histogram prediction off F'
+                cls_score, feat, cloth_score, cloth_feat, _, _, _, hist_pred = model(
                     img, target_cloth=target_cloth_id)
                 # Convert to float32 for loss computation
                 cls_score = cls_score.float()
@@ -212,6 +219,7 @@ def do_train(
             loss, parts = loss_func(cls_score, feat, target, target_cloth_id,
                                     cloth_score=cloth_score, cloth_feat=cloth_feat,
                                     positive_mask=pos_mask, use_cal=cal_active,
+                                    hist_pred=hist_pred, hist_target=hist_target,
                                     return_parts=True)
 
             if scaler is not None:
@@ -229,7 +237,7 @@ def do_train(
             # the one computed on live features above.
             if cal_active:
                 with torch.autocast(device_type=device_type, enabled=(device_type == "cuda")):
-                    detached_score, _, _, _, _, _, _ = model(
+                    detached_score, _, _, _, _, _, _, _ = model(
                         img, target_cloth=target_cloth_id, detach_cloth=True)
                 detached_score = detached_score.float()
                 dis_loss = loss_func.discriminator_loss(
@@ -255,13 +263,13 @@ def do_train(
                 torch.cuda.synchronize()
             if(n_iter + 1) % log_period == 0:
                 logger.info("Epoch[{}] Iteration[{}/{}] Loss: {:.3f} "
-                            "(id {} | tri {} | cloth {} | adv {} | dis {}) "
+                            "(id {} | tri {} | cloth {} | adv {} | dis {} | hist {}) "
                             "Acc: {:.1%} (cloth {:.1%}) Lr: {:.2e}"
                             .format(epoch, (n_iter + 1), len(train_loader),
                                     loss_meter.avg,
                                     _fmt(parts['id']), _fmt(parts['triplet']),
                                     _fmt(parts['cloth']), _fmt(parts.get('adv')),
-                                    _fmt(parts['disentangle']),
+                                    _fmt(parts['disentangle']), _fmt(parts.get('hist')),
                                     acc_meter.avg, cloth_acc_meter.avg,
                                     scheduler.get_last_lr()[0]))
         end_time = time.time()

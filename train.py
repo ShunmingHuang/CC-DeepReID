@@ -89,12 +89,23 @@ if __name__ == '__main__':
     loss_func = make_loss(cfg, num_classes=bundle.num_train_pids,
                           num_cloth_classes=num_cloth_classes)
 
+    # With CAL the clothing classifier is owned by its own discriminator
+    # optimizer (built in the processor), so it must NOT also be stepped by the
+    # main optimizer -- otherwise its effective lr is the sum of the two and
+    # CAL_LR stops meaning anything. This mirrors C2R, where the clothes
+    # classifier is a separate module the main optimizer never sees.
+    exclude_from_main = []
+    if cfg.MODEL.USE_CAL:
+        exclude_from_main.append('cloth_classifier')
+        logger.info('CAL is on: cloth_classifier excluded from the main optimizer')
+
     optimizer = build_optimizer(
         model,
         optim=cfg.SOLVER.OPTIMIZER_NAME.lower() if cfg.SOLVER.OPTIMIZER_NAME.lower() in ['adam', 'amsgrad', 'sgd', 'rmsprop', 'radam'] else 'adam',
         lr=cfg.SOLVER.BASE_LR,
         weight_decay=cfg.SOLVER.WEIGHT_DECAY,
-        momentum=cfg.SOLVER.MOMENTUM
+        momentum=cfg.SOLVER.MOMENTUM,
+        exclude=exclude_from_main
     )
 
     scheduler = build_lr_scheduler(

@@ -25,6 +25,7 @@ is free to differ and does):
   clothing, so it cannot absorb identity-discriminative structure.
 """
 
+import torch
 import torch.nn as nn
 
 from .clothes_adversarial_loss import ClothesBasedAdversarialLoss
@@ -70,6 +71,16 @@ class CombinedLoss(nn.Module):
         self.disentangle_loss = ClothDisentangleLoss(
             margin=getattr(cfg.MODEL, 'DISENTANGLE_MARGIN', None))
 
+        # ---- colour-histogram regression (CSCI's annotation-free supervision) ----
+        # CSCI regresses its colour token onto an RGB-uv histogram; profile 44 uses
+        # Cosine_Similarity (1 - |cos|). Runs ALONGSIDE the cloth softmax.
+        self.use_hist = bool(getattr(cfg.MODEL, 'USE_HIST', False))
+        self.hist_weight = float(getattr(cfg.MODEL, 'HIST_LOSS_WEIGHT', 1.0))
+        self.hist_loss_type = getattr(cfg.MODEL, 'HIST_LOSS', 'cosine')
+        if self.hist_loss_type not in ('cosine', 'mse', 'l1'):
+            raise ValueError("HIST_LOSS must be 'cosine', 'mse' or 'l1', got '{}'"
+                             .format(self.hist_loss_type))
+
         # ---- C2R-ReID clothes-based adversarial loss (optional) ----
         self.use_cal = bool(getattr(cfg.MODEL, 'USE_CAL', False))
         self.cal_weight = getattr(cfg.MODEL, 'CAL_WEIGHT', 1.0)
@@ -77,13 +88,24 @@ class CombinedLoss(nn.Module):
             scale=getattr(cfg.MODEL, 'CAL_SCALE', 16.0),
             epsilon=getattr(cfg.MODEL, 'CAL_EPSILON', 0.1))
 
+    def histogram_loss(self, hist_pred, hist_target):
+        """CSCI eq.: MSE(mean=False) / 1 - |cos| / L1 between prediction and label."""
+        if self.hist_loss_type == 'cosine':
+            cos = (torch.nn.functional.normalize(hist_pred.float(), p=2, dim=-1)
+                   * torch.nn.functional.normalize(hist_target.float(), p=2, dim=-1)
+                   ).sum(-1)
+            return (1 - cos.abs()).mean()
+        if self.hist_loss_type == 'l1':
+            return (hist_pred.float() - hist_target.float()).abs().mean()
+        return ((hist_pred.float() - hist_target.float()) ** 2).mean()
+
     def discriminator_loss(self, cloth_score_detached, target_cloth_id, positive_mask):
         """CAL on DETACHED features: trains the clothing discriminator only."""
         return self.cal(cloth_score_detached, target_cloth_id, positive_mask)
 
     def forward(self, id_score, id_feat, target, target_cloth_id=None,
                 cloth_score=None, cloth_feat=None, positive_mask=None,
-                use_cal=False, return_parts=False):
+                use_cal=False, hist_pred=None, hist_target=None, return_parts=False):
         id_term = self.id_loss(inputs=id_score, targets=target)
         loss = self.id_weight * id_term
 
@@ -112,12 +134,17 @@ class CombinedLoss(nn.Module):
             disentangle_term = self.disentangle_loss(id_feat, cloth_feat)
             loss = loss + self.disentangle_weight * disentangle_term
 
+        hist_term = None
+        if self.use_hist and hist_pred is not None and hist_target is not None:
+            hist_term = self.histogram_loss(hist_pred, hist_target)
+            loss = loss + self.hist_weight * hist_term
+
         if return_parts:
             def _f(x):
                 return None if x is None else float(x.detach())
             return loss, {'id': _f(id_term), 'triplet': _f(triplet_term),
                           'cloth': _f(cloth_term), 'adv': _f(adv_term),
-                          'disentangle': _f(disentangle_term)}
+                          'disentangle': _f(disentangle_term), 'hist': _f(hist_term)}
         return loss
 
 

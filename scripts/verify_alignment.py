@@ -404,8 +404,8 @@ def verify_dual_branch(root):
     model = make_model(c, num_classes=3, num_cloth_classes=6)
     model.train()
     out = model(torch.randn(4, 3, 256, 128))
-    check(len(out) == 7, 'train forward returns 7 outputs', len(out))
-    id_score, F, cloth_score, Fp, global_feat, map_id, map_cloth = out
+    check(len(out) == 8, 'train forward returns 8 outputs', len(out))
+    id_score, F, cloth_score, Fp, global_feat, map_id, map_cloth = out[:7]
     check(id_score.shape == (4, 3), 'F -> id logits (B, num_id)', tuple(id_score.shape))
     check(cloth_score.shape == (4, 6), 'F\' -> cloth logits (B, num_cloth)',
           tuple(cloth_score.shape))
@@ -467,8 +467,8 @@ def verify_dual_branch(root):
     # ---- 4) losses: F gets ID+triplet, F\' gets ID-only, plus disentangle ----
     loss_func = make_loss(c, num_classes=3, num_cloth_classes=6)
     model.train()
-    id_score, F, cloth_score, Fp, _, _, _ = model(torch.randn(6, 3, 256, 128),
-                                            target_cloth=torch.tensor([0, 1, 2, 3, 4, 5]))
+    id_score, F, cloth_score, Fp = model(torch.randn(6, 3, 256, 128),
+                                         target_cloth=torch.tensor([0, 1, 2, 3, 4, 5]))[:4]
     check(cloth_score is not None and Fp is not None,
           'singleton cloth classes still produce a cloth branch (BN fallback, no crash)')
     target = torch.tensor([0, 0, 1, 1, 2, 2])
@@ -557,7 +557,7 @@ def verify_dual_branch(root):
         opt.zero_grad()
         # eval() returns only F, so run the branch heads manually for training
         model.train()
-        id_score, F, cloth_score, Fp, _, _, _ = model(x, target_cloth=cloth12)
+        id_score, F, cloth_score, Fp = model(x, target_cloth=cloth12)[:4]
         model.eval()
         loss, _ = loss_func(id_score, F, target12, cloth12,
                             cloth_score=cloth_score, cloth_feat=Fp, return_parts=True)
@@ -576,8 +576,9 @@ def verify_dual_branch(root):
     plain.train()
     out = plain(torch.randn(4, 3, 256, 128))
     # the tuple shape is kept identical across modes; the dual-branch extras are None
-    check(len(out) == 7 and out[2] is None and out[5] is None and out[6] is None,
-          'dual_branch=False keeps the legacy path (no cloth head, no maps)',
+    check(len(out) == 8 and out[2] is None and out[5] is None and out[6] is None
+          and out[7] is None,
+          'dual_branch=False keeps the legacy path (no cloth head, no maps, no hist)',
           [None if x is None else getattr(x, 'shape', type(x).__name__) for x in out])
     check(out[1].shape == (4, 2048), 'legacy F is still the plain pooled descriptor',
           tuple(out[1].shape))
@@ -634,9 +635,9 @@ def verify_cal_and_cloth_head(root):
 
     # ---- 3) detach path: the discriminator must NOT reach the backbone ----
     m_cos.zero_grad()
-    det_score, _, _, det_feat, _, _, _ = m_cos(
+    det_score, _, _, det_feat = m_cos(
         torch.randn(4, 3, 256, 128), target_cloth=torch.tensor([0, 1, 2, 3, 4, 5]),
-        detach_cloth=True)
+        detach_cloth=True)[:4]
     check(det_score is not None and det_feat is not None,
           'detach_cloth forward returns cloth logits + features')
     check(not det_feat.requires_grad,
@@ -660,8 +661,8 @@ def verify_cal_and_cloth_head(root):
 
     # ---- 4) the live path DOES reach the backbone (that is the adversarial term) ----
     m_cos.zero_grad()
-    live_score, _, _, _, _, _, _ = m_cos(
-        torch.randn(4, 3, 256, 128), target_cloth=torch.tensor([0, 1, 2, 3, 4, 5]))
+    live_score = m_cos(
+        torch.randn(4, 3, 256, 128), target_cloth=torch.tensor([0, 1, 2, 3, 4, 5]))[0]
     live_score.float().sum().backward()
     bb_grad_live = next(p for n, p in m_cos.named_parameters()
                         if n.startswith('base.') and p.requires_grad).grad
@@ -714,7 +715,56 @@ def verify_cal_and_cloth_head(root):
           'CAL epoch gate: inactive before CAL_START_EPOCH, active from it on',
           'start={}'.format(start))
 
-    # ---- 8) USE_CAL guards ----
+    # ---- 9) with CAL the cloth classifier must NOT be in the main optimizer ----
+    # (C2R keeps the clothes classifier out of the main optimizer entirely; here it
+    #  is a submodule of the model, so it has to be excluded explicitly)
+    from solver import build_optimizer
+    c_cal = cfg.clone()
+    c_cal.merge_from_list(['MODEL.DEVICE', 'cpu', 'MODEL.NECK', 'none',
+                           'MODEL.USE_CAL', True, 'MODEL.CLOTH_HEAD', 'cosine',
+                           'DATALOADER.NUM_WORKERS', 0])
+    c_cal.freeze()
+    m_cal = make_model(c_cal, num_classes=3, num_cloth_classes=6)
+
+    # two optimizers over the SAME module, so parameter identity is comparable
+    with_cal = build_optimizer(m_cal, optim='adam', lr=1e-3,
+                               weight_decay=1e-4, momentum=0.9,
+                               exclude=['cloth_classifier'])
+    without = build_optimizer(m_cal, optim='adam', lr=1e-3,
+                              weight_decay=1e-4, momentum=0.9)
+
+    def _opt_ids(opt):
+        return {id(p) for g in opt.param_groups for p in g['params']}
+
+    main_ids, nocall_ids = _opt_ids(with_cal), _opt_ids(without)
+    cloth_ids = {id(p) for p in m_cal.cloth_classifier.parameters()}
+    check(not (main_ids & cloth_ids),
+          'exclude=["cloth_classifier"] keeps it OUT of the main optimizer',
+          len(main_ids & cloth_ids))
+    check(nocall_ids & cloth_ids,
+          'without the exclude list it WOULD be in the main optimizer (control)',
+          len(nocall_ids & cloth_ids))
+    check(len(nocall_ids) - len(main_ids) == len(cloth_ids),
+          'exactly the cloth classifier params were removed',
+          (len(nocall_ids), len(main_ids), len(cloth_ids)))
+    # every other parameter must still be optimised
+    other_ids = {id(p) for n, p in m_cal.named_parameters()
+                 if not n.startswith('cloth_classifier')}
+    check(other_ids <= main_ids,
+          'every other parameter is still optimised by the main optimizer',
+          len(other_ids - main_ids))
+
+    # and the separate discriminator optimizer can still move it
+    opt_cc = torch.optim.Adam(m_cal.cloth_classifier.parameters(), lr=1e-2)
+    before = m_cal.cloth_classifier.weight.detach().clone()
+    m_cal.train()
+    cl = m_cal(torch.randn(4, 3, 256, 128),
+               target_cloth=torch.tensor([0, 1, 2, 3, 4, 5]))[2]
+    cl.float().pow(2).mean().backward()
+    opt_cc.step()
+    check(not torch.allclose(before, m_cal.cloth_classifier.weight),
+          'the discriminator optimizer can still update the cloth classifier',
+          float((before - m_cal.cloth_classifier.weight).abs().max()))
     c_bad = c.clone()
     c_bad.merge_from_list(['MODEL.USE_CAL', True])
     c_bad.freeze()
@@ -725,6 +775,119 @@ def verify_cal_and_cloth_head(root):
           'without a clothing branch the CAL guard has something to catch')
     check(_ml(c_bad, num_classes=3, num_cloth_classes=6).use_cal,
           'USE_CAL is read from the config into the loss bundle')
+
+
+def verify_histogram(root):
+    """CSCI's colour-histogram regression on F', alongside the cloth softmax."""
+    print('\n=== CSCI colour-histogram supervision on F\' ===')
+    import importlib.util
+
+    import torch.nn.functional as Fn
+    from configs import cfg
+    from datasets.histogram import HistogramExtractor, RGBuvHistBlock
+    from losses import make_loss
+    from models import make_model
+
+    # ---- 1) bit-identical to CSCI's RGBuvHistBlock ----
+    csci_path = os.path.join(ROOT, '..', 'ICCV-CSCI-Person-ReID', 'data', 'rgbuc.py')
+    if os.path.isfile(csci_path):
+        spec = importlib.util.spec_from_file_location('csci_rgbuc', csci_path)
+        csci = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(csci)
+        torch.manual_seed(0)
+        ok_all = True
+        for h, sigma, iscale, go, size in [(32, 0.001, False, False, (192, 384)),
+                                           (32, 0.02, False, False, (128, 256)),
+                                           (64, 0.001, True, False, (256, 128)),
+                                           (16, 0.001, False, True, (192, 384))]:
+            x = torch.rand(1, 3, *size).clamp(0, 1)
+            a = RGBuvHistBlock(h=h, sigma=sigma, intensity_scale=iscale,
+                               green_only=go, device='cpu')(x)
+            b = csci.RGBuvHistBlock(h=h, insz=150, sigma=sigma,
+                                    intensity_scale=iscale, green_only=go,
+                                    device='cpu')(x)
+            ok_all &= torch.allclose(a, b, atol=1e-7)
+        check(ok_all, 'RGBuvHistBlock is bit-identical to CSCI\'s implementation')
+    else:
+        print('  [skip] CSCI checkout not found, cannot compare the histogram')
+
+    # ---- 2) the block enforces its batch-1 contract ----
+    try:
+        RGBuvHistBlock(h=32)(torch.rand(2, 3, 128, 64))
+        check(False, 'histogram block rejects batch > 1')
+    except ValueError:
+        check(True, 'histogram block rejects batch > 1 (CSCI only fills sample 0)')
+
+    # ---- 3) the label really is an annotation-free colour descriptor ----
+    ex = HistogramExtractor(h=32, sigma=0.001, norm='l1', weight=100.0)
+    img = torch.randn(1, 3, 384, 192)
+    lab = ex(img)
+    check(tuple(lab.shape) == (1, 1024), 'label shape is (1, HIST_DIM**2)', tuple(lab.shape))
+    check(abs(float(lab.abs().sum()) - 100.0) < 1e-3,
+          'L1 normalisation + weight 100 reproduce CSCI\'s label scale',
+          float(lab.abs().sum()))
+    lab2 = ex(torch.randn(1, 3, 384, 192))
+    check(float((lab - lab2).abs().max()) > 0,
+          'different images give different colour labels (it is image-derived)')
+    # a flat grey image must land at the centre bin, not on an edge
+    grey = ex(torch.full((1, 3, 384, 192), 0.5))
+    check(torch.isfinite(grey).all(), 'grey image gives a finite histogram')
+
+    # ---- 4) model + loss wiring ----
+    c = cfg.clone()
+    c.merge_from_list(['MODEL.DEVICE', 'cpu', 'MODEL.NECK', 'none',
+                       'MODEL.USE_HIST', True, 'MODEL.HIST_DIM', 32,
+                       'DATALOADER.NUM_WORKERS', 0])
+    c.freeze()
+    model = make_model(c, num_classes=3, num_cloth_classes=6)
+    check(model.hist_head is not None, 'USE_HIST installs a histogram head')
+    hist_dim = model.hist_dim
+    check(hist_dim == 1024, 'head output width == HIST_DIM**2', hist_dim)
+    model.train()
+    out = model(torch.randn(4, 3, 256, 128),
+                target_cloth=torch.tensor([0, 1, 2, 3, 4, 5]))
+    check(len(out) == 8, 'train forward now returns 8 items', len(out))
+    hist_pred = out[7]
+    check(hist_pred is not None and tuple(hist_pred.shape) == (4, hist_dim),
+          'histogram prediction has shape (B, HIST_DIM**2)', tuple(hist_pred.shape))
+    # it must be computed FROM F', so perturbing F' must change the prediction
+    with torch.no_grad():
+        base = hist_pred.detach().clone()
+    h2 = model.hist_head(out[3] + 1.0)
+    check(float((h2 - base).abs().max()) > 0,
+          'histogram head is a function of F\' (perturbing F\' changes the output)',
+          float((h2 - base).abs().max()))
+
+    # ---- 5) the loss: cosine / mse / l1 + cloth softmax still active ----
+    loss_func = make_loss(c, num_classes=3, num_cloth_classes=6)
+    target = torch.tensor([0, 0, 1, 1])
+    target_cloth = torch.tensor([0, 1, 2, 3])
+    target_hist = ex(torch.randn(1, 3, 256, 128)).expand(4, -1).contiguous()
+    total, parts = loss_func(out[0], out[1], target, target_cloth,
+                             cloth_score=out[2], cloth_feat=out[3],
+                             hist_pred=hist_pred, hist_target=target_hist,
+                             return_parts=True)
+    check(parts['hist'] is not None, 'histogram term is active and reported',
+          parts['hist'])
+    check(torch.isfinite(total), 'total loss with the histogram term is finite',
+          float(total))
+    check(parts['cloth'] is not None,
+          'cloth softmax is STILL active next to the histogram term (kept, as asked)',
+          parts['cloth'])
+    check(parts['hist'] < 1.0 + 1e-6, 'cosine histogram loss is in [0, 2]',
+          parts['hist'])
+
+    # turning it off must restore the previous behaviour
+    c_off = cfg.clone()
+    c_off.merge_from_list(['MODEL.DEVICE', 'cpu', 'MODEL.NECK', 'none',
+                           'MODEL.USE_HIST', False, 'DATALOADER.NUM_WORKERS', 0])
+    c_off.freeze()
+    m_off = make_model(c_off, num_classes=3, num_cloth_classes=6)
+    m_off.train()
+    out_off = m_off(torch.randn(4, 3, 256, 128),
+                    target_cloth=torch.tensor([0, 1, 2, 3, 4, 5]))
+    check(m_off.hist_head is None and out_off[7] is None and len(out_off) == 8,
+          'USE_HIST=False keeps the 8-slot tuple but disables the head')
 
 
 def main():
@@ -740,6 +903,7 @@ def main():
         verify_make_dataloader(root)
         verify_dual_branch(root)
         verify_cal_and_cloth_head(root)
+        verify_histogram(root)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
