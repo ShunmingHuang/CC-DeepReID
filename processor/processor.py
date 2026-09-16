@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from utils.meter import AverageMeter
 from utils.metrics import R1_mAP_eval, R1_mAP_eval_CC
-from losses.clothes_adversarial_loss import positive_clothes_mask
 
 
 def _empty_cache():
@@ -146,24 +145,6 @@ def do_train(
 
     scaler = torch.GradScaler(device_type) if device.type == "cuda" else None
 
-    # ---- C2R-ReID clothes discriminator: separate optimizer, delayed start ----
-    use_cal = bool(getattr(cfg.MODEL, 'USE_CAL', False))
-    cal_start = int(getattr(cfg.MODEL, 'CAL_START_EPOCH', 25))
-    optimizer_cc = None
-    if use_cal:
-        if model.cloth_classifier is None:
-            raise RuntimeError('MODEL.USE_CAL=True needs the clothing branch '
-                               '(MODEL.DUAL_BRANCH + a non-empty cloth vocabulary)')
-        if bundle.pid2clothes is None:
-            raise RuntimeError('MODEL.USE_CAL=True needs bundle.pid2clothes, but the '
-                               'dataset did not provide it')
-        optimizer_cc = torch.optim.Adam(
-            model.cloth_classifier.parameters(),
-            lr=float(getattr(cfg.MODEL, 'CAL_LR', cfg.SOLVER.BASE_LR)),
-            weight_decay=cfg.SOLVER.WEIGHT_DECAY)
-        logger.info('C2R CAL enabled: discriminator optimizer=lr {}, starts at epoch {}'
-                    .format(getattr(cfg.MODEL, 'CAL_LR', cfg.SOLVER.BASE_LR), cal_start))
-
     best_score = -1.0
     best_rank1 = 0.0
     best_map = 0.0
@@ -174,9 +155,6 @@ def do_train(
         acc_meter.reset()
         cloth_acc_meter.reset()
 
-        # CAL is off before its start epoch: neither the discriminator nor the
-        # adversarial term is active, matching C2R's START_EPOCH_CC/ADV schedule.
-        cal_active = use_cal and epoch >= cal_start
         model.train()
 
         for n_iter, batch in enumerate(train_loader):
@@ -186,20 +164,12 @@ def do_train(
             hist_target = batch[4] if len(batch) > 4 else None
 
             optimizer.zero_grad()
-            if cal_active:
-                optimizer_cc.zero_grad()
 
             img = img.to(device)
             target = pid.to(device)
             target_cloth_id = cloth_id.to(device)
             if hist_target is not None:
                 hist_target = hist_target.to(device)
-
-            # positive mask: all clothing classes owned by each anchor's identity
-            pos_mask = None
-            if cal_active:
-                pos_mask = positive_clothes_mask(
-                    bundle.pid2clothes, target, device=device)
 
             with torch.autocast(device_type=device_type, enabled=(device_type == "cuda")):
                 # dual-branch model: F (id), F' (cloth), the un-pooled attention
@@ -218,7 +188,6 @@ def do_train(
 
             loss, parts = loss_func(cls_score, feat, target, target_cloth_id,
                                     cloth_score=cloth_score, cloth_feat=cloth_feat,
-                                    positive_mask=pos_mask, use_cal=cal_active,
                                     hist_pred=hist_pred, hist_target=hist_target,
                                     return_parts=True)
 
@@ -229,26 +198,6 @@ def do_train(
             else:
                 loss.backward()
                 optimizer.step()
-
-            # ---- C2R discriminator step, AFTER the backbone step ----
-            # Same clothing head, but driven by the detached features so the
-            # discriminator learns from "frozen" representations and its gradient
-            # never reaches the backbone. The adversarial term the backbone saw is
-            # the one computed on live features above.
-            if cal_active:
-                with torch.autocast(device_type=device_type, enabled=(device_type == "cuda")):
-                    detached_score, _, _, _, _, _, _, _ = model(
-                        img, target_cloth=target_cloth_id, detach_cloth=True)
-                detached_score = detached_score.float()
-                dis_loss = loss_func.discriminator_loss(
-                    detached_score, target_cloth_id, pos_mask)
-                if scaler is not None:
-                    scaler.scale(dis_loss).backward()
-                    scaler.step(optimizer_cc)
-                    scaler.update()
-                else:
-                    dis_loss.backward()
-                    optimizer_cc.step()
 
             loss_meter.update(loss.item(), img.shape[0])
 
@@ -263,12 +212,12 @@ def do_train(
                 torch.cuda.synchronize()
             if(n_iter + 1) % log_period == 0:
                 logger.info("Epoch[{}] Iteration[{}/{}] Loss: {:.3f} "
-                            "(id {} | tri {} | cloth {} | adv {} | dis {} | hist {}) "
+                            "(id {} | tri {} | cloth {} | dis {} | hist {}) "
                             "Acc: {:.1%} (cloth {:.1%}) Lr: {:.2e}"
                             .format(epoch, (n_iter + 1), len(train_loader),
                                     loss_meter.avg,
                                     _fmt(parts['id']), _fmt(parts['triplet']),
-                                    _fmt(parts['cloth']), _fmt(parts.get('adv')),
+                                    _fmt(parts['cloth']),
                                     _fmt(parts['disentangle']), _fmt(parts.get('hist')),
                                     acc_meter.avg, cloth_acc_meter.avg,
                                     scheduler.get_last_lr()[0]))

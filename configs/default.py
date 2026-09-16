@@ -19,15 +19,24 @@ cfg.MODEL.NO_MARGIN = False
 cfg.MODEL.LABELSMOOTH = True
 
 # -----------------------------------------------------------------------------
-# Dual-branch channel attention (behind the ResNet50 backbone)
-#   F  = identity branch  : ID (softmax) + triplet loss, used at test time
-#   F' = clothing branch  : ID-style softmax over the clothing vocabulary
-#   F vs F'               : pushed apart (orthogonal) by ClothDisentangleLoss
+# Dual-branch shared trunk (S2A-style)
+#   F  = identity branch               : ID (softmax) + triplet loss
+#   F' = identity-independent branch   : cloth softmax (+ optional colour histogram)
+#   F vs F'                            : pushed apart (orthogonal)
+# The two branches are contiguous channel blocks of ONE shared feature map.
+#
+# S2A_MODE picks HOW the isolation is done (see models/backbones/s2a_resnet.py):
+#   's2a'    : CSCI's mechanism -- SHARED spatial K/V (both branches read one
+#              scene, so a branch can steer the other through it) and an isolated
+#              per-branch query. Isolation of the decision only.
+#   'sealed' : every convolution uses groups=B, so branch 0 cannot influence
+#              branch 1 on the direct OR the indirect path. Strictly stronger
+#              isolation than CSCI, and a different mechanism.
 # -----------------------------------------------------------------------------
 cfg.MODEL.DUAL_BRANCH = True
-cfg.MODEL.ATT_REDUCTION = 16          # squeeze-excite bottleneck ratio
-cfg.MODEL.CLOTH_FEAT_DIM = -1         # -1 keeps F' at 2048 (same width as F)
-cfg.MODEL.ATT_PROJECTOR = False       # optional BN+FC head on F'
+cfg.MODEL.S2A_MODE = 's2a'            # 's2a' (matches CSCI) | 'sealed'
+cfg.MODEL.S2A_BRANCHES = 2            # B; branch 0 = F (identity), 1 = F' (indep.)
+cfg.MODEL.S2A_BRANCH_WIDTH = 2048     # width of ONE branch's features; map is B x this
 cfg.MODEL.CLOTH_LOSS_WEIGHT = 1.0     # weight of the F' clothing softmax
 cfg.MODEL.DISENTANGLE_WEIGHT = 1.0    # weight of the F / F' separation term
 cfg.MODEL.DISENTANGLE_MARGIN = None   # None -> |cos| (CSCI); float -> hinge
@@ -38,17 +47,6 @@ cfg.MODEL.DISENTANGLE_MARGIN = None   # None -> |cos| (CSCI); float -> hinge
 #            weights, so the logits are cosine similarities
 cfg.MODEL.CLOTH_HEAD = 'linear'
 cfg.MODEL.CLOTH_HEAD_SCALE = 16.0     # only used when CLOTH_HEAD == 'cosine'
-
-# ---- C2R-ReID clothes-based adversarial loss (CAL) ----
-# The clothing discriminator is trained on DETACHED features with its own
-# optimizer, and only from MODEL.CAL_START_EPOCH onwards; the backbone sees the
-# same loss through live (non-detached) features.
-cfg.MODEL.USE_CAL = False
-cfg.MODEL.CAL_WEIGHT = 1.0
-cfg.MODEL.CAL_SCALE = 16.0
-cfg.MODEL.CAL_EPSILON = 0.1
-cfg.MODEL.CAL_START_EPOCH = 25        # 1-based epoch at which CAL switches on
-cfg.MODEL.CAL_LR = 3.5e-4             # lr of the discriminator's own optimizer
 
 # ---- colour-histogram regression on F' (CSCI's annotation-free supervision) ----
 # A second supervision that runs ALONGSIDE the cloth softmax (which is kept).

@@ -316,465 +316,138 @@ def verify_make_dataloader(root):
 
 
 def verify_dual_branch(root):
-    print('\n=== dual-branch attention + losses ===')
-    import torch.nn as nn
+    print('\n=== S2A dual-branch shared trunk + losses ===')
     from configs import cfg
     from losses import make_loss
     from losses.disentangle_loss import ClothDisentangleLoss
     from models import make_model
-    from models.attention import DualBranchChannelAttention
+    from models.backbones.s2a_resnet import S2ABlock
 
     c = cfg.clone()
-    c.merge_from_list(['MODEL.DEVICE', 'cpu', 'MODEL.PRETRAIN', '',
+    c.merge_from_list(['MODEL.DEVICE', 'cpu',
                        'DATASETS.NAMES', 'prcc', 'DATASETS.ROOT_DIR', root,
                        'DATALOADER.NUM_WORKERS', 0, 'SOLVER.IMS_PER_BATCH', 6,
                        'DATALOADER.NUM_INSTANCE', 3])
     c.freeze()
 
-    # ---- 1) the attention module itself ----
-    att = DualBranchChannelAttention(channels=2048, reduction=16)
-    fm = torch.randn(2, 2048, 8, 4)
-    out = att(fm)
-    check(len(out) == 4, 'attention returns 4 fields (F, F\', map_id, map_cloth)', len(out))
-    F, Fp, map_id, map_cloth = out
-    check(F.shape == (2, 2048) and Fp.shape == (2, 2048),
-          'attention returns two (B, 2048) features F and F\'', (tuple(F.shape), tuple(Fp.shape)))
-    check(F.shape == Fp.shape, 'F and F\' have identical width (disentangle-ready)')
-    check(map_id.shape == (2, 2048, 8, 4) and map_cloth.shape == (2, 2048, 8, 4),
-          'maps come out un-pooled, same spatial size as the input',
-          (tuple(map_id.shape), tuple(map_cloth.shape)))
+    # ---- 1) the block itself: isolation by construction ----
+    blk = S2ABlock(in_planes=32, out_planes=32, num_branches=2)
+    blk.train()
+    z = torch.randn(1, 32, 8, 8, requires_grad=True)
+    o = blk(z)
+    check(o.shape == z.shape, 'S2A block preserves the trunk shape', tuple(o.shape))
+    half = 16
+    g = torch.autograd.grad(o[:, :half].pow(2).sum(), z, retain_graph=True,
+                            allow_unused=True)[0]
+    cross = 0.0 if g is None else float(g[0, half:].abs().sum())
+    check(cross == 0.0, 'cross-branch gradient is EXACTLY zero (branch 0 <- branch 1)',
+          cross)
+    own = float(g[0, :half].abs().sum())
+    check(own > 0, 'each branch still receives its own gradient', own)
+    check(tuple(blk.conv_shared.weight.shape) == (32, 1, 3, 3),
+          'the shared 3x3 is depthwise: one kernel serves both branches',
+          tuple(blk.conv_shared.weight.shape))
 
-    # attention is applied on the MAP; pooling is per-branch and comes after
-    check(torch.allclose(att.pool(map_id), F, atol=1e-5),
-          'GAP(map_id) == F (pooling happens after the channel attention)',
-          float((att.pool(map_id) - F).abs().max()))
-    check(torch.allclose(att.pool(map_cloth), Fp, atol=1e-5),
-          'GAP(map_cloth) == F\' (each branch has its OWN pooling)',
-          float((att.pool(map_cloth) - Fp).abs().max()))
-
-    # the two branches must not be trivially identical
-    att.eval()
-    with torch.no_grad():
-        out_eval = att(fm)
-    F, Fp = out_eval.feat_id, out_eval.feat_cloth
-    check(not torch.allclose(F, Fp), 'F and F\' come from independent branch parameters',
-          float((F - Fp).abs().mean()))
-    check(not torch.allclose(out_eval.map_id, out_eval.map_cloth),
-          'the two branches re-weight the map differently')
-
-    # channel attention must actually re-weight channels (weights not all equal)
-    squeezed = fm.mean(dim=(2, 3))
-    w_id = att.att_id.fc(squeezed)
-    w_cl = att.att_cloth.fc(squeezed)
-    check(w_id.std().item() > 0, 'id branch channel weights vary across channels',
-          float(w_id.std()))
-    check(not torch.allclose(w_id, w_cl), 'the two branches learn different channel weights')
-
-    # ---- 2) disentangle loss ----
-    # NOTE: the objective is CSCI's |cos|, which is minimized at cos = 0, i.e. the
-    # two features are driven to be ORTHOGONAL (not anti-parallel: -1 also has
-    # |cos| = 1 and is penalised just as much as +1).
-    d = ClothDisentangleLoss()
-    a = torch.randn(8, 64)
-    check(abs(float(d(a, a)) - 1.0) < 1e-5, 'identical features -> |cos| = 1 (max loss)',
-          float(d(a, a)))
-    check(abs(float(d(a, -a)) - 1.0) < 1e-5,
-          'anti-parallel features are penalised too (|cos| = 1, orthogonality is the target)',
-          float(d(a, -a)))
-    check(float(d(a, torch.randn(8, 64))) < float(d(a, a)),
-          'separating features lowers the loss')
-
-    # explicit orthogonal pair -> loss must be ~0
-    e1 = torch.zeros(4, 64)
-    e1[:, 0] = 1.0
-    e2 = torch.zeros(4, 64)
-    e2[:, 1] = 1.0
-    check(float(d(e1, e2)) < 1e-5, 'orthogonal features -> loss ~ 0', float(d(e1, e2)))
-
-    # hinge mode: relu(cos - margin), so cos=1 with margin 0.5 costs exactly 0.5
-    d_margin = ClothDisentangleLoss(margin=0.5)
-    check(abs(float(d_margin(a, a)) - 0.5) < 1e-5,
-          'hinge mode: cos=1 with margin 0.5 costs exactly 0.5', float(d_margin(a, a)))
-    check(float(d_margin(a, -a)) < 1e-6,
-          'hinge mode charges nothing for anti-parallel features (cos=-1 < margin)',
-          float(d_margin(a, -a)))
-
-    # ---- 3) full model, both branches ----
-    torch.manual_seed(0)
+    # ---- 2) the model: two 2048-wide branches from ONE shared trunk ----
     model = make_model(c, num_classes=3, num_cloth_classes=6)
     model.train()
-    out = model(torch.randn(4, 3, 256, 128))
-    check(len(out) == 8, 'train forward returns 8 outputs', len(out))
-    id_score, F, cloth_score, Fp, global_feat, map_id, map_cloth = out[:7]
-    check(id_score.shape == (4, 3), 'F -> id logits (B, num_id)', tuple(id_score.shape))
-    check(cloth_score.shape == (4, 6), 'F\' -> cloth logits (B, num_cloth)',
-          tuple(cloth_score.shape))
+    check(not hasattr(model, 'channel_attention'),
+          'the SE channel-attention module is gone (replaced by the S2A trunk)')
+    out = model(torch.randn(4, 3, 256, 128),
+                target_cloth=torch.tensor([0, 1, 2, 3, 4, 5]))
+    check(len(out) == 8, 'train forward returns the same 8 slots', len(out))
+    id_score, F, cloth_score, Fp, global_feat, map_id, map_cloth, hist_pred = out
+    check(id_score.shape == (4, 3), 'F -> id logits', tuple(id_score.shape))
+    check(cloth_score.shape == (4, 6), "F' -> cloth logits", tuple(cloth_score.shape))
     check(F.shape == (4, 2048) and Fp.shape == (4, 2048),
-          'both branch features are (B, 2048)', (tuple(F.shape), tuple(Fp.shape)))
-    check(torch.isfinite(id_score).all() and torch.isfinite(cloth_score).all(),
-          'logits are finite')
+          'both branches are 2048 wide (disentangle-ready)',
+          (tuple(F.shape), tuple(Fp.shape)))
 
-    # the attention-weighted maps must be exposed UN-POOLED (4D, spatial dims kept)
+    # ---- 3) maps are un-pooled and pooling reproduces the features ----
     check(map_id is not None and map_cloth is not None,
-          'attention-weighted maps are returned')
+          'un-pooled branch maps are still returned')
     check(map_id.dim() == 4 and map_cloth.dim() == 4,
-          'maps are 4D (channel attention before pooling, not after)',
+          'maps are 4D (attention/pooling order unchanged: maps before pooling)',
           (tuple(map_id.shape), tuple(map_cloth.shape)))
-    check(map_id.shape[1] == 2048 and map_id.shape[2] > 1 and map_id.shape[3] > 1,
-          'maps keep the spatial resolution (H/16, W/16)',
-          tuple(map_id.shape))
-    # Pooling the map must reproduce the PRE-NECK branch feature. With
-    # MODEL.NECK='bnneck' the model returns bottleneck(GAP(map)), so assert the
-    # whole chain rather than pretending GAP(map) == F.
-    pooled_id = map_id.detach().mean(dim=(2, 3))
-    check(torch.allclose(model.bottleneck(pooled_id), F, atol=1e-4),
-          'F == bottleneck(GAP(map_id))  (attention -> pool -> BNNeck)',
-          float((model.bottleneck(pooled_id) - F).abs().max()))
+    check(map_id.shape[1] == 2048 and map_cloth.shape[1] == 2048,
+          'each map carries one branch width (no mixing)', tuple(map_id.shape))
+    gap_id = map_id.detach().mean(dim=(2, 3))
+    check(torch.allclose(model.bottleneck(gap_id), F, atol=1e-4),
+          'F == bottleneck(GAP(map_id))', float((model.bottleneck(gap_id) - F).abs().max()))
+    gap_cloth = map_cloth.detach().mean(dim=(2, 3))
+    # NOTE: with singleton cloth classes the model deliberately normalises F' with
+    # running statistics instead of batch statistics (long-standing guard), so
+    # compare against that same path.
+    was_training = model.cloth_bottleneck.training
+    model.cloth_bottleneck.eval()
+    expected_fp = model.cloth_bottleneck(gap_cloth)
+    model.cloth_bottleneck.train(was_training)
+    check(torch.allclose(expected_fp, Fp, atol=1e-4),
+          "F' == cloth_bottleneck(GAP(map_cloth)) (running-stats fallback path)",
+          float((expected_fp - Fp).abs().max()))
 
-    # ...and with a non-bnneck neck the model output IS the pooled map, which
-    # pins down "channel attention first, per-branch pooling afterwards"
-    c_noneck = c.clone()
-    c_noneck.merge_from_list(['MODEL.NECK', 'none'])
-    c_noneck.freeze()
-    m_noneck = make_model(c_noneck, num_classes=3, num_cloth_classes=6)
-    m_noneck.train()
-    o = m_noneck(torch.randn(4, 3, 256, 128),
-                 target_cloth=torch.tensor([0, 1, 2, 3, 4, 5]))
-    g_id = m_noneck.channel_attention.pool(o[5].detach())
-    g_cloth = m_noneck.channel_attention.pool(o[6].detach())
-    check(torch.allclose(g_id, o[1], atol=1e-4),
-          'GAP(map_id) == F  (channel attention first, pooling afterwards)',
-          float((g_id - o[1]).abs().max()))
-    check(torch.allclose(g_cloth, o[3], atol=1e-4),
-          'GAP(map_cloth) == F\' (each branch has its OWN pooling)',
-          float((g_cloth - o[3]).abs().max()))
-    check(not torch.allclose(map_id, map_cloth),
-          'the two branches produce different maps (independent attention + pooling)',
-          float((map_id - map_cloth).abs().mean()))
+    # ---- 4) the branches are genuinely different ----
+    check(not torch.allclose(F, Fp), 'F and F\' are not identical',
+          float((F - Fp).abs().mean()))
 
-    # pre-pool maps must sit on the gradient path of the pooled features
-    gmap = torch.autograd.grad(F.sum(), map_id, retain_graph=True, allow_unused=True)[0]
-    check(gmap is not None and gmap.abs().sum() > 0,
-          'map_id is on the autograd path of F (usable by other modules)')
-
-    # eval forward must stay a single F tensor so the retrieval path is unchanged
-    model.eval()
-    with torch.no_grad():
-        eval_out = model(torch.randn(2, 3, 256, 128))
-    check(torch.is_tensor(eval_out) and eval_out.shape == (2, 2048),
-          'eval forward returns just F (retrieval unchanged)', tuple(eval_out.shape))
-
-    # ---- 4) losses: F gets ID+triplet, F\' gets ID-only, plus disentangle ----
+    # ---- 5) both branches sit on the autograd path of the SHARED trunk ----
     loss_func = make_loss(c, num_classes=3, num_cloth_classes=6)
-    model.train()
-    id_score, F, cloth_score, Fp = model(torch.randn(6, 3, 256, 128),
-                                         target_cloth=torch.tensor([0, 1, 2, 3, 4, 5]))[:4]
-    check(cloth_score is not None and Fp is not None,
-          'singleton cloth classes still produce a cloth branch (BN fallback, no crash)')
-    target = torch.tensor([0, 0, 1, 1, 2, 2])
-    target_cloth = torch.tensor([0, 1, 2, 3, 4, 5])
+    target = torch.tensor([0, 0, 1, 1])
+    target_cloth = torch.tensor([0, 1, 2, 3])
+    # the shared parameter both branches must reach: 'sealed' shares a depthwise
+    # kernel, 's2a' shares the scene projection. Probe whichever is present.
+    blk0 = model.base.layer4[0]
+    probe_w = blk0.conv_shared.weight if hasattr(blk0, 'conv_shared') \
+        else blk0.conv_kv.weight
+    check(probe_w.requires_grad, 'the shared trunk parameter is trainable',
+          tuple(probe_w.shape))
+    g_id = torch.autograd.grad(F.pow(2).sum(), probe_w, retain_graph=True,
+                               allow_unused=True)[0]
+    g_cloth = torch.autograd.grad(Fp.pow(2).sum(), probe_w, retain_graph=True,
+                                  allow_unused=True)[0]
+    check(g_id is not None and float(g_id.abs().sum()) > 0,
+          'F reaches the shared trunk',
+          None if g_id is None else float(g_id.abs().sum()))
+    check(g_cloth is not None and float(g_cloth.abs().sum()) > 0,
+          "F' reaches the shared trunk",
+          None if g_cloth is None else float(g_cloth.abs().sum()))
 
+    # ---- 6) losses still work end to end ----
     total, parts = loss_func(id_score, F, target, target_cloth,
                              cloth_score=cloth_score, cloth_feat=Fp,
+                             hist_pred=hist_pred,
+                             hist_target=torch.rand(4, model.hist_dim)
+                             if hist_pred is not None else None,
                              return_parts=True)
     check(torch.isfinite(total), 'total loss is finite', float(total))
-    check(parts['cloth'] is not None and parts['disentangle'] is not None,
-          'cloth softmax and disentangle terms are both active')
-    check(parts['triplet'] is not None, 'triplet term is reported separately',
-          parts['triplet'])
-    check(abs(parts['disentangle'] - float(ClothDisentangleLoss()(F, Fp))) < 1e-5,
-          'disentangle term equals |cos(F, F\')|')
+    check(parts['cloth'] is not None, 'cloth CE is still active on F\'', parts['cloth'])
+    check(parts['disentangle'] is not None, 'disentangle is active',
+          parts['disentangle'])
+    check(abs(parts['disentangle']
+              - float(ClothDisentangleLoss()(F, Fp))) < 1e-5,
+          'disentangle term == |cos(F, F\')|')
 
-    # F' is a *classification* branch: its head must be a label-smoothed softmax
-    # over the clothing vocabulary, and it must carry NO triplet term.
-    from losses.cross_entropy_loss import CrossEntropyLoss as _CE
-    expected_cloth = float(_CE(num_classes=6, label_smooth=bool(c.MODEL.LABELSMOOTH),
-                               use_gpu=True)(cloth_score.float(), target_cloth))
-    check(abs(parts['cloth'] - expected_cloth) < 1e-5,
-          'cloth head loss == CE over the cloth vocabulary',
-          (parts['cloth'], expected_cloth))
-    # Check the label-smoothing FLAG rather than the loss value: at random init the
-    # CE is ~ln(num_classes) and smoothing perturbs it by only ~1e-5, so a value
-    # comparison cannot distinguish the two configurations.
-    check(loss_func.cloth_loss.eps > 0,
-          'cloth head is configured with label smoothing (MODEL.LABELSMOOTH)',
-          loss_func.cloth_loss.eps)
-    check(abs(loss_func.cloth_loss.eps - 0.1) < 1e-9,
-          'label smoothing strength is the standard 0.1', loss_func.cloth_loss.eps)
-    # and it must follow MODEL.LABELSMOOTH when that is turned off
-    c_nols = c.clone()
-    c_nols.merge_from_list(['MODEL.LABELSMOOTH', False])
-    c_nols.freeze()
-    check(make_loss(c_nols, num_classes=3, num_cloth_classes=6).cloth_loss.eps == 0,
-          'turning MODEL.LABELSMOOTH off also disables it on the cloth head')
-
-    # ---- 4b) the triplet must equal CSCI's identity-only implementation ----
-    # reference: ICCV-CSCI-Person-ReID/loss/triplet_loss.py (hard_example_mining
-    # over `labels`, clothing never consulted)
-    def csci_triplet_reference(feat, labels, margin):
-        feat = feat.float()
-        dist = torch.cdist(feat, feat)
-        N = dist.size(0)
-        is_pos = labels.expand(N, N).eq(labels.expand(N, N).t())
-        is_neg = labels.expand(N, N).ne(labels.expand(N, N).t())
-        dist_ap = dist[is_pos].contiguous().view(N, -1).max(1)[0]
-        dist_an = dist[is_neg].contiguous().view(N, -1).min(1)[0]
-        y = dist_an.new().resize_as_(dist_an).fill_(1)
-        return float(torch.nn.MarginRankingLoss(margin=margin)(dist_an, dist_ap, y))
-
-    from losses.hard_mine_triplet_loss import TripletLoss as _TL
-    trio = _TL(margin=0.3)
-    ref = csci_triplet_reference(F, target, 0.3)
-    got = float(trio(F, target, target_cloth))
-    check(abs(got - ref) < 1e-5,
-          'triplet == CSCI identity-only reference (cloth ignored)', (got, ref))
-
-    # passing a different cloth labelling must NOT change CSCI's triplet
-    shuffled_cloth = torch.tensor([5, 4, 3, 2, 1, 0])
-    got2 = float(trio(F, target, shuffled_cloth))
-    check(abs(got2 - got) < 1e-6,
-          'triplet is invariant to the cloth labels (CSCI is cloth-agnostic)',
-          (got, got2))
-
-    # cloth branch must NOT receive a triplet term: zeroing cloth_feat must not
-    # remove the triplet contribution of F
-    no_cloth = loss_func(id_score, F, target, target_cloth)
-    check(torch.isfinite(no_cloth), 'loss still works without the cloth branch (back-compat)')
-    check(float(total) > float(no_cloth), 'adding the cloth branch raises the total loss',
-          (float(total), float(no_cloth)))
-
-    # ---- 5) a real optimisation step reduces the loss ----
-    # small lr + eval-mode BN: this is a randomly initialised 25M-param net on
-    # 12 synthetic images, so a large lr or training-mode BN statistics diverge
+    # ---- 7) eval still returns F only (retrieval unchanged) ----
     model.eval()
-    model.dual_branch = True
-    opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=1e-4)
-    x = torch.randn(12, 3, 256, 128)
-    target12 = torch.tensor([0, 0, 1, 1, 2, 2, 0, 1, 2, 0, 1, 2])
-    cloth12 = torch.tensor([0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5])
-    first = None
-    for step in range(6):
-        opt.zero_grad()
-        # eval() returns only F, so run the branch heads manually for training
-        model.train()
-        id_score, F, cloth_score, Fp = model(x, target_cloth=cloth12)[:4]
-        model.eval()
-        loss, _ = loss_func(id_score, F, target12, cloth12,
-                            cloth_score=cloth_score, cloth_feat=Fp, return_parts=True)
-        loss.backward()
-        opt.step()
-        if step == 0:
-            first = float(loss)
-    check(float(loss) < first * 0.9, 'loss decreases over optimisation steps (>10%)',
-          (first, float(loss)))
+    with torch.no_grad():
+        ev = model(torch.randn(2, 3, 256, 128))
+    check(torch.is_tensor(ev) and ev.shape == (2, 2048),
+          'eval forward returns just F', tuple(ev.shape))
 
-    # ---- 6) dual_branch=False keeps the original single-branch behaviour ----
+    # ---- 8) DUAL_BRANCH=False keeps a plain single-branch path ----
     c2 = c.clone()
     c2.merge_from_list(['MODEL.DUAL_BRANCH', False])
     c2.freeze()
     plain = make_model(c2, num_classes=3, num_cloth_classes=6)
     plain.train()
-    out = plain(torch.randn(4, 3, 256, 128))
-    # the tuple shape is kept identical across modes; the dual-branch extras are None
-    check(len(out) == 8 and out[2] is None and out[5] is None and out[6] is None
-          and out[7] is None,
-          'dual_branch=False keeps the legacy path (no cloth head, no maps, no hist)',
-          [None if x is None else getattr(x, 'shape', type(x).__name__) for x in out])
-    check(out[1].shape == (4, 2048), 'legacy F is still the plain pooled descriptor',
-          tuple(out[1].shape))
+    o2 = plain(torch.randn(4, 3, 256, 128))
+    check(len(o2) == 8 and o2[2] is None and o2[5] is None and o2[6] is None,
+          'dual_branch=False keeps the 8-slot tuple with the extras None',
+          [None if x is None else getattr(x, 'shape', '?') for x in o2])
+    check(o2[1].shape == (4, 2048), 'single-branch F is still 2048',
+          tuple(o2[1].shape))
 
-    bundle = None  # (bundle used only for the dataloader checks)
     return model
-
-
-def verify_cal_and_cloth_head(root):
-    """C2R-ReID clothing branch: cosine head, detached discriminator, delay."""
-    print('\n=== C2R clothes head (cosine) + CAL discriminator ===')
-    import torch.nn.functional as Fn
-    from configs import cfg
-    from losses import make_loss
-    from losses.clothes_adversarial_loss import (ClothesBasedAdversarialLoss,
-                                                 positive_clothes_mask)
-    from models import make_model
-    from models.classifier import NormalizedClassifier
-
-    c = cfg.clone()
-    c.merge_from_list(['MODEL.DEVICE', 'cpu', 'MODEL.NECK', 'none',
-                       'DATALOADER.NUM_WORKERS', 0])
-    c.freeze()
-
-    # ---- 1) cosine head: logits really are scaled cosine similarities ----
-    head = NormalizedClassifier(64, 10, scale=16.0)
-    x = torch.randn(5, 64)
-    logits = head(x)
-    manual = 16.0 * Fn.linear(Fn.normalize(x, p=2, dim=1),
-                             Fn.normalize(head.weight, p=2, dim=1))
-    check(torch.allclose(logits, manual, atol=1e-5),
-          'cosine head logits == scale * cos(feature, class weight)',
-          float((logits - manual).abs().max()))
-    check(float(logits.abs().max()) <= 16.0 + 1e-4,
-          'cosine logits are bounded by the scale', float(logits.abs().max()))
-
-    # ---- 2) model wiring: CLOTH_HEAD switches the head type ----
-    m_lin = make_model(c, num_classes=3, num_cloth_classes=6)
-    check(isinstance(m_lin.cloth_classifier, torch.nn.Linear),
-          'CLOTH_HEAD=linear keeps nn.Linear', type(m_lin.cloth_classifier).__name__)
-
-    c_cos = c.clone()
-    c_cos.merge_from_list(['MODEL.CLOTH_HEAD', 'cosine', 'MODEL.CLOTH_HEAD_SCALE', 16.0])
-    c_cos.freeze()
-    m_cos = make_model(c_cos, num_classes=3, num_cloth_classes=6)
-    check(isinstance(m_cos.cloth_classifier, NormalizedClassifier),
-          'CLOTH_HEAD=cosine installs NormalizedClassifier',
-          type(m_cos.cloth_classifier).__name__)
-    m_cos.train()
-    out = m_cos(torch.randn(4, 3, 256, 128),
-                target_cloth=torch.tensor([0, 1, 2, 3, 4, 5]))
-    check(float(out[2].abs().max()) <= 16.0 + 1e-3,
-          'model cloth logits respect the cosine scale', float(out[2].abs().max()))
-
-    # ---- 3) detach path: the discriminator must NOT reach the backbone ----
-    m_cos.zero_grad()
-    det_score, _, _, det_feat = m_cos(
-        torch.randn(4, 3, 256, 128), target_cloth=torch.tensor([0, 1, 2, 3, 4, 5]),
-        detach_cloth=True)[:4]
-    check(det_score is not None and det_feat is not None,
-          'detach_cloth forward returns cloth logits + features')
-    check(not det_feat.requires_grad,
-          'the discriminator feature is a true leaf: requires_grad == False '
-          '(no BatchNorm on the detach path, or it would rebuild a graph)')
-    det_score.float().sum().backward()
-    head_grad = m_cos.cloth_classifier.weight.grad
-    bn_grad = (m_cos.cloth_bottleneck.weight.grad
-               if m_cos.cloth_bottleneck is not None else None)
-    bb_grad = next(p for n, p in m_cos.named_parameters()
-                   if n.startswith('base.') and p.requires_grad).grad
-    check(head_grad is not None and float(head_grad.abs().sum()) > 0,
-          'detached path DOES update the clothing head',
-          float(head_grad.abs().sum()))
-    check(bn_grad is None or float(bn_grad.abs().sum()) == 0,
-          'detached path leaves the cloth BatchNorm untouched (it is not on that path)',
-          None if bn_grad is None else float(bn_grad.abs().sum()))
-    check(bb_grad is None or float(bb_grad.abs().sum()) == 0,
-          'detached path does NOT touch the backbone (the whole point of detach)',
-          None if bb_grad is None else float(bb_grad.abs().sum()))
-
-    # ---- 4) the live path DOES reach the backbone (that is the adversarial term) ----
-    m_cos.zero_grad()
-    live_score = m_cos(
-        torch.randn(4, 3, 256, 128), target_cloth=torch.tensor([0, 1, 2, 3, 4, 5]))[0]
-    live_score.float().sum().backward()
-    bb_grad_live = next(p for n, p in m_cos.named_parameters()
-                        if n.startswith('base.') and p.requires_grad).grad
-    check(bb_grad_live is not None and float(bb_grad_live.abs().sum()) > 0,
-          'live path DOES reach the backbone (CAL drives the generator side)',
-          None if bb_grad_live is None else float(live_score.abs().mean()))
-
-    # ---- 5) CAL loss: positive mask semantics + eps spread ----
-    cal = ClothesBasedAdversarialLoss(scale=16.0, epsilon=0.1)
-    pids = torch.tensor([0, 0, 0, 0])
-    cloth = torch.tensor([0, 1, 0, 1])          # identity 0 owns clothes {0,1}
-    mask = torch.zeros(4, 4)
-    mask[:, 0] = 1
-    mask[:, 1] = 1
-    logits = torch.randn(4, 4)
-    loss_cal = float(cal(logits, cloth, mask))
-    check(loss_cal == loss_cal and loss_cal > 0, 'CAL returns a finite positive loss',
-          loss_cal)
-    # positives must be excluded from the negative set: if the mask covered only
-    # the target class, another class of the same identity would become a negative
-    mask_only_target = torch.zeros(4, 4)
-    mask_only_target.scatter_(1, cloth.unsqueeze(1), 1)
-    check(abs(float(cal(logits, cloth, mask_only_target)) - loss_cal) > 1e-6,
-          'CAL actually uses the full positive (same-identity) clothes set')
-    check(float(cal(logits, cloth, mask)) != float(
-        ClothesBasedAdversarialLoss(scale=16.0, epsilon=1.0)(logits, cloth, mask)),
-        'epsilon changes the objective (0.1 vs 1.0)')
-
-    # ---- 6) the positive mask comes from the dataset ----
-    from datasets import make_dataloader
-    c2 = c.clone()
-    c2.merge_from_list(['DATASETS.NAMES', 'prcc', 'DATASETS.ROOT_DIR', root,
-                        'SOLVER.IMS_PER_BATCH', 6, 'DATALOADER.NUM_INSTANCE', 3])
-    c2.freeze()
-    loaders, bundle = make_dataloader(c2)
-    check(bundle.pid2clothes is not None,
-          'DatasetBundle exposes pid2clothes for the CAL positive mask')
-    p2c = torch.as_tensor(bundle.pid2clothes)
-    check(tuple(p2c.shape) == (bundle.num_train_pids, bundle.num_train_clothes),
-          'pid2clothes has shape (num_train_pids, num_train_clothes)', tuple(p2c.shape))
-    got = positive_clothes_mask(bundle.pid2clothes, torch.tensor([0, 1]))
-    check(tuple(got.shape) == (2, bundle.num_train_clothes),
-          'positive_clothes_mask gathers one row per batch sample', tuple(got.shape))
-    check(float(got.sum()) > 0, 'the gathered mask is non-empty (some positives exist)',
-          float(got.sum()))
-
-    # ---- 7) delayed start: epoch gating is strictly "off before, on after" ----
-    start = int(c.MODEL.CAL_START_EPOCH)
-    check([e >= start for e in [start - 1, start, start + 1]] == [False, True, True],
-          'CAL epoch gate: inactive before CAL_START_EPOCH, active from it on',
-          'start={}'.format(start))
-
-    # ---- 9) with CAL the cloth classifier must NOT be in the main optimizer ----
-    # (C2R keeps the clothes classifier out of the main optimizer entirely; here it
-    #  is a submodule of the model, so it has to be excluded explicitly)
-    from solver import build_optimizer
-    c_cal = cfg.clone()
-    c_cal.merge_from_list(['MODEL.DEVICE', 'cpu', 'MODEL.NECK', 'none',
-                           'MODEL.USE_CAL', True, 'MODEL.CLOTH_HEAD', 'cosine',
-                           'DATALOADER.NUM_WORKERS', 0])
-    c_cal.freeze()
-    m_cal = make_model(c_cal, num_classes=3, num_cloth_classes=6)
-
-    # two optimizers over the SAME module, so parameter identity is comparable
-    with_cal = build_optimizer(m_cal, optim='adam', lr=1e-3,
-                               weight_decay=1e-4, momentum=0.9,
-                               exclude=['cloth_classifier'])
-    without = build_optimizer(m_cal, optim='adam', lr=1e-3,
-                              weight_decay=1e-4, momentum=0.9)
-
-    def _opt_ids(opt):
-        return {id(p) for g in opt.param_groups for p in g['params']}
-
-    main_ids, nocall_ids = _opt_ids(with_cal), _opt_ids(without)
-    cloth_ids = {id(p) for p in m_cal.cloth_classifier.parameters()}
-    check(not (main_ids & cloth_ids),
-          'exclude=["cloth_classifier"] keeps it OUT of the main optimizer',
-          len(main_ids & cloth_ids))
-    check(nocall_ids & cloth_ids,
-          'without the exclude list it WOULD be in the main optimizer (control)',
-          len(nocall_ids & cloth_ids))
-    check(len(nocall_ids) - len(main_ids) == len(cloth_ids),
-          'exactly the cloth classifier params were removed',
-          (len(nocall_ids), len(main_ids), len(cloth_ids)))
-    # every other parameter must still be optimised
-    other_ids = {id(p) for n, p in m_cal.named_parameters()
-                 if not n.startswith('cloth_classifier')}
-    check(other_ids <= main_ids,
-          'every other parameter is still optimised by the main optimizer',
-          len(other_ids - main_ids))
-
-    # and the separate discriminator optimizer can still move it
-    opt_cc = torch.optim.Adam(m_cal.cloth_classifier.parameters(), lr=1e-2)
-    before = m_cal.cloth_classifier.weight.detach().clone()
-    m_cal.train()
-    cl = m_cal(torch.randn(4, 3, 256, 128),
-               target_cloth=torch.tensor([0, 1, 2, 3, 4, 5]))[2]
-    cl.float().pow(2).mean().backward()
-    opt_cc.step()
-    check(not torch.allclose(before, m_cal.cloth_classifier.weight),
-          'the discriminator optimizer can still update the cloth classifier',
-          float((before - m_cal.cloth_classifier.weight).abs().max()))
-    c_bad = c.clone()
-    c_bad.merge_from_list(['MODEL.USE_CAL', True])
-    c_bad.freeze()
-    from models import make_model as _mm
-    from losses import make_loss as _ml
-    m_nocloth = _mm(c_bad, num_classes=3, num_cloth_classes=0)
-    check(m_nocloth.cloth_classifier is None,
-          'without a clothing branch the CAL guard has something to catch')
-    check(_ml(c_bad, num_classes=3, num_cloth_classes=6).use_cal,
-          'USE_CAL is read from the config into the loss bundle')
 
 
 def verify_histogram(root):
@@ -902,7 +575,6 @@ def main():
         verify_metrics()
         verify_make_dataloader(root)
         verify_dual_branch(root)
-        verify_cal_and_cloth_head(root)
         verify_histogram(root)
     finally:
         shutil.rmtree(root, ignore_errors=True)

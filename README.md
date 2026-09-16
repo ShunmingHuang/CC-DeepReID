@@ -5,7 +5,7 @@ attention**, with the data layer and evaluation protocol aligned to
 `ICCV-CSCI-Person-ReID`.
 
 This document records what the framework *is*, which conventions are frozen, and
-which knobs exist — so later experiments do not silently break the plumbing.
+which knobs exist  so later experiments do not silently break the plumbing.
 
 ---
 
@@ -13,39 +13,51 @@ which knobs exist — so later experiments do not silently break the plumbing.
 
 ```
 image
-  └─ ResNet50 (last_stride=1)                        → (B, 2048, H/16, W/16)
-       └─ DualBranchChannelAttention                  models/attention.py
-            ├─ SE branch 1 (re-weights the map) ────→ map_id    (B, 2048, H/16, W/16)
-            │                                            └─ GAP → F   (B, 2048)
-            └─ SE branch 2 (re-weights the map) ────→ map_cloth (B, 2048, H/16, W/16)
-                                                         └─ GAP → F'  (B, 2048)
-                 F  → BNNeck → classifier_id     → id logits
-                 F' → BNNeck → classifier_cloth  → cloth logits
+  └─ S2A trunk (models/backbones/s2a_resnet.py)   ↀ(B, 2 x branch_width, H/16, W/16)
+       ─ one shared trunk; branch identity is a channel block
+       ├─ channels [0 : W]      ──▀map_id    ──GAP──▀F   (identity branch)
+       └─ channels [W : 2W]     ──▀map_cloth ──GAP──▀F'  (identity-independent branch)
+                 F  ↀBNNeck ↀclassifier_id     ↀid logits
+                 F' ↀBNNeck ↀclassifier_cloth  ↀcloth logits
 ```
 
 > **Naming.** `F` is the **identity** branch. `F'` is the **identity-independent**
-> branch — it exists to carry whatever is *not* the person's identity, and
+> branch  it exists to carry whatever is *not* the person's identity, and
 > clothing classification is only the supervision currently attached to it
-> (`CLOTH_HEAD`, optional `CAL`). Read every `cloth*` identifier as "the module
-> currently hanging off the identity-independent branch", not as the branch's
-> definition: further modules will be attached there, and `map_cloth` is exposed
-> precisely so they can consume the un-pooled spatial features.
+> (plus the optional colour histogram). `map_cloth` is exposed un-pooled so other
+> modules can consume the spatial features.
 
-**Channel attention comes first, pooling comes after**, and **the pooling is
-per-branch** — each branch pools its own attention-weighted map:
+The two branches are contiguous **channel blocks of one shared feature map**. How
+they are kept apart is chosen by `MODEL.S2A_MODE`, and the two options are
+*genuinely different mechanisms* (see `S2A_DESIGN.md` for the measured table):
 
-* `map_id` / `map_cloth` are the attention-weighted maps *before* pooling. They
-  are returned by the training forward so other modules can attach to the
-  spatial features; they sit on the autograd path of `F` / `F'`.
-* The SE gate needs a global pool *statistic* to compute its channel weights —
-  that is inherent to squeeze-and-excitation (the "squeeze") and is not the
-  pooling that produces `F` / `F'`.
+* **`'s2a'` (default)**  reproduces CSCI's `EvaAttention_sep_masked`: a **shared
+  spatial scene** (`conv_kv`, built from all channels) that both branches read,
+  with only the **decision** isolated (each branch has its own query/key, and
+  neither appears in the other's read). Direct coupling is 0; indirect coupling
+  through the shared scene is **not** 0, which is the point of the design.
+* **`'sealed'`**  the earlier, stricter variant: every convolution uses
+  `groups=B`, so no weight and no gradient crosses the branches on either the
+  direct or the indirect path. Measured exactly `0` for both, by
+  `scripts/check_s2a.py`. This is *stronger* isolation than CSCI's, and a
+  different mechanism.
 
-Each `SE branch` is `mean(C) → Linear(C→C/r) → ReLU → Linear(C/r→C) → Sigmoid`
-applied as per-channel weights on the spatial map. The branches have
-**independent attention parameters and independent pooling**, so they can
-specialise. `GAP(map_id) == F` (up to `MODEL.NECK`) and `GAP(map_cloth) == F'`
-are asserted in `scripts/verify_alignment.py`.
+* `MODEL.S2A_MODE`  `'s2a'` or `'sealed'` (see above).
+* `MODEL.S2A_BRANCHES` (B, default 2)  how many isolated branches.
+* `MODEL.S2A_BRANCH_WIDTH`  width of ONE branch; the trunk is `B x` this. Cost:
+
+  | branch_width | trunk out | per branch | params (`sealed`) | vs ResNet50 |
+  |---|---|---|---|---|
+  | 512  | 1024 | 512  | 3.40M  | 0.14x |
+  | 1024 | 2048 | 1024 | 13.22M | 0.56x |
+  | **2048** (default) | **4096** | **2048** | **52.09M** | **2.22x** |
+
+  The default keeps the classic 2048-d feature at 2.22x the parameters. Use 512 if
+  the budget matters more than the feature width. At the same default,
+  `S2A_MODE: s2a` costs **64.01M (2.72x)** — the shared scene and its read-out are
+  what the extra 11M buys.
+* The SE channel-attention module (`models/attention.py`) has been **deleted**; the
+  isolation now lives in the trunk itself.
 
 Training forward returns, in order::
 
@@ -68,16 +80,16 @@ L = W_id  · CE_id(F)              # label-smoothed identity softmax     (F)
 
 * `Triplet(F)` is CSCI's triplet **verbatim** (`losses/hard_mine_triplet_loss.py`
   is transcribed from `ICCV-CSCI-Person-ReID/loss/triplet_loss.py`):
-  `hard_example_mining` mines positives by *identity* only — **clothing is never
+  `hard_example_mining` mines positives by *identity* only  **clothing is never
   consulted**. `targets_cloth` is still accepted by the signature and ignored.
   An earlier CC-DeepReID version used a *cloth-aware* triplet
   (`mask_pos = same_id & different_cloth`); that was experiment residue and has
   been removed. (`scripts/verify_alignment.py` asserts bit-for-bit equality with
   a re-implementation of CSCI's triplet.)
-* `CE_cloth(F')` follows the same recipe as `CE_id(F)` — label-smoothed when
+* `CE_cloth(F')` follows the same recipe as `CE_id(F)`  label-smoothed when
   `MODEL.LABELSMOOTH` is on. Note this is a **deliberate deviation**: CSCI uses
   plain `nn.CrossEntropyLoss()` for its clothing head.
-* `F'` gets **no triplet term at all** — it is only asked to classify clothing,
+* `F'` gets **no triplet term at all**  it is only asked to classify clothing,
   so it cannot absorb identity-discriminative structure.
 * The separation term is CSCI's `Cosine_Disentangle`: `|cos|` is minimized at
   `cos = 0`, i.e. the two features are driven **orthogonal**. Note `|cos|` also
@@ -87,7 +99,7 @@ L = W_id  · CE_id(F)              # label-smoothed identity softmax     (F)
 * `F` is the feature used at test time; the retrieval path is unchanged by the
   dual branch.
 
-> Where strict CSCI alignment **is** required — and is enforced by
+> Where strict CSCI alignment **is** required  and is enforced by
 > `scripts/audit_real_datasets.py` against the real data: the split protocol, and
 > where every `cloth_id` comes from (§2).
 
@@ -100,7 +112,7 @@ Entry point: `datasets/make_dataloader(cfg) -> (loaders, bundle)`.
 Data tuples are **4-tuples** `(img_path, pid, camid, cloth_id)` (CSCI carries an
 extra all-zero `aux_info` slot that is unused here).
 
-### PRCC — two protocols over one gallery
+### PRCC  two protocols over one gallery
 
 | split | source | note |
 |---|---|---|
@@ -113,13 +125,13 @@ extra all-zero `aux_info` slot that is unused here).
 * File naming differs between splits (this is how the PRCC release is built):
   `train`/`val` use `<cam>_cropped_rgb###.jpg` inside `<pid>/`, `test` uses
   `cropped_rgb###.jpg` inside `<cam>/<pid>/`.
-* Cloth semantics: `<pid>` for A/B, `<pid>C` for C → **two cloth labels per
+* Cloth semantics: `<pid>` for A/B, `<pid>C` for C ↀ**two cloth labels per
   identity** in train, matching CSCI's `pid*2` / `pid*2+1`.
 * In test, A and B **share** a cloth id and C differs. This is what makes
   `same pid AND same cloth` pruning keep exactly the clothing-change pairs:
   A↔C for CC, A↔B for Standard.
 
-### LTCC — one split, rule applied at eval time
+### LTCC  one split, rule applied at eval time
 
 | split | source |
 |---|---|
@@ -138,10 +150,10 @@ extra all-zero `aux_info` slot that is unused here).
 
 `MODEL`-agnostic; controlled by config:
 
-* `TEST.MODE = 'both'` → PRCC: `CC` (test/C) **and** `Standard` (test/B);
+* `TEST.MODE = 'both'` ↀPRCC: `CC` (test/C) **and** `Standard` (test/B);
   LTCC: `CC` **and** `General`.
-* `TEST.MODE = 'cc'` → only the clothes-changing number.
-* `TEST.EVAL_PROTOCOL = 'CC'` → which protocol picks the best checkpoint.
+* `TEST.MODE = 'cc'` ↀonly the clothes-changing number.
+* `TEST.EVAL_PROTOCOL = 'CC'` ↀwhich protocol picks the best checkpoint.
 
 ---
 
@@ -163,22 +175,17 @@ Model (`MODEL.*`):
 
 | key | default | meaning |
 |---|---|---|
-| `DUAL_BRANCH` | `True` | `False` restores the single-branch baseline |
-| `ATT_REDUCTION` | `16` | SE bottleneck ratio |
-| `CLOTH_FEAT_DIM` | `-1` | `-1` keeps `F'` at 2048 (same width as `F`) |
-| `ATT_PROJECTOR` | `False` | optional BN+FC head on `F'` |
+| `DUAL_BRANCH` | `True` | `False` falls back to a plain single-branch ResNet50 |
+| `S2A_MODE` | `s2a` | `s2a` = CSCI's shared-scene/isolated-decision block; `sealed` = strict `groups=B` isolation |
+| `S2A_BRANCHES` | `2` | how many branches (0 = F, 1 = F') |
+| `S2A_BRANCH_WIDTH` | `2048` | width of ONE branch; the map is `B x` this |
 | `CLOTH_LOSS_WEIGHT` | `1.0` | weight of `CE_cloth(F')` |
 | `DISENTANGLE_WEIGHT` | `1.0` | weight of the separation term |
-| `DISENTANGLE_MARGIN` | `None` | `None` → `\|cos\|` (CSCI); float → hinge |
+| `DISENTANGLE_MARGIN` | `None` | `None` ↀ`\|cos\|` (CSCI); float ↀhinge |
 | `NO_MARGIN` | `False` | triplet margin = 0 when `True` |
 | `LABELSMOOTH` | `True` | label smoothing for both softmax heads |
 | `CLOTH_HEAD` | `linear` | `linear` = dot-product head; `cosine` = C2R-ReID's `NormalizedClassifier` |
 | `CLOTH_HEAD_SCALE` | `16.0` | logit scale, used only by the cosine head |
-| `USE_CAL` | `False` | enable C2R's clothes-based adversarial loss |
-| `CAL_WEIGHT` | `1.0` | weight of the adversarial term the backbone optimises |
-| `CAL_SCALE` / `CAL_EPSILON` | `16.0` / `0.1` | CAL temperature / positive-class spread |
-| `CAL_START_EPOCH` | `25` | **1-based epoch at which CAL switches on** |
-| `CAL_LR` | `3.5e-4` | learning rate of the discriminator's own optimizer |
 | `USE_HIST` | `False` | add CSCI's colour-histogram regression on `F'` |
 | `HIST_DIM` | `32` | bins per axis; the label/prediction length is `HIST_DIM**2` |
 | `HIST_HIDDEN` | `1024` | hidden width of the regression head |
@@ -195,10 +202,8 @@ Model (`MODEL.*`):
 **alongside** the cloth softmax (which is kept unchanged):
 
 ```
-augmented image ─┬─► backbone ─► F' ─► hist_head ─► hist_pred ─┐
-                 │                                             ├─► 1-|cos|
-                 └─► RGBuvHistBlock ─► L1 norm ×100 ─► label ───┘
-```
+augmented image ─┬─▀backbone ─▀F' ─▀hist_head ─▀hist_pred ──                 ─                                            ├─▀1-|cos|
+                 └─▀RGBuvHistBlock ─▀L1 norm ×100 ─▀label ────```
 
 * The target is an **RGB-uv histogram** (`datasets/histogram.py`, transcribed from
   CSCI's `data/rgbuc.py`), computed from the *same augmented tensor* that feeds the
@@ -216,47 +221,17 @@ augmented image ─┬─► backbone ─► F' ─► hist_head ─► hist_pre
   calls it per sample and it raises on `B > 1` instead of silently zeroing.
 * The cloth softmax keeps running next to it -- the two supervisions are additive.
 
-### C2R-ReID clothes branch (optional)
+### C2R-ReID clothes head (optional)
 
-Two independent switches, both off by default.
-
-**1. `MODEL.CLOTH_HEAD='cosine'`** — replaces `F'`'s dot-product classifier with
+**`MODEL.CLOTH_HEAD='cosine'`**  replaces `F'`'s dot-product classifier with
 C2R's `NormalizedClassifier` (`models/classifier.py`): the feature *and* the class
 weights are L2-normalised, so the logits are `scale * cos(...)`. Motivated by the
 long-tailed clothing classes (LTCC: 1..14 outfits per identity).
 
-**2. `MODEL.USE_CAL=True`** — adds C2R's clothes-based adversarial loss (CAL). The
-**same** clothing head is used twice per iteration, on two different graphs:
-
-```
-backbone step : cloth_score = head(bottleneck(F'))               # LIVE   -> CAL -> loss
-discriminator : cloth_score = head(pool(map_cloth.detach()))     # FROZEN -> CAL -> optimizer_cc
-```
-
-* the discriminator has its **own optimizer** and runs **after** the backbone
-  step, so its gradient never reaches the backbone;
-* the discriminator path deliberately **skips `cloth_bottleneck`** — a
-  parameterised normalisation there would build its own `grad_fn` and the branch
-  would stop being a pure "frozen feature" probe;
-* both are gated by `MODEL.CAL_START_EPOCH`: before it, neither the discriminator
-  nor the adversarial term runs (C2R's `START_EPOCH_CC`/`START_EPOCH_ADV`);
-* **`cloth_classifier` is excluded from the main optimizer** when `USE_CAL=True`
-  (`train.py` passes `exclude=['cloth_classifier']` to `build_optimizer`). In C2R
-  the clothes classifier is a separate module the main optimizer never sees; here
-  it is a submodule of the model, so it has to be removed explicitly -- otherwise
-  it is stepped twice per iteration and its effective lr is the sum of
-  `SOLVER.BASE_LR` and `CAL_LR`. Note the *backbone* still receives the cloth
-  softmax gradient (only the head's own weights are excluded), and `cloth_bottleneck`
-  is still in the main optimizer, exactly as `F'`'s normalisation is part of `F'`;
-* the positive mask is C2R's `pid2clothes[pids]` — every clothing class owned by
-  the anchor's identity. `DatasetBundle` exposes it as
-  `(num_train_pids, num_train_clothes)`, built by the dataset classes.
-
-> The adversarial term is **not** an attribute-removal loss. It is a weighted
-> negative log-likelihood that spreads probability over the identity's *own*
-> outfits, and the backbone **minimises** it. Whether that makes the backbone
-> clothes-agnostic is an empirical question, not a consequence of the code — see
-> the note in `losses/clothes_adversarial_loss.py`.
+> C2R's **clothes-based adversarial loss (CAL)** was implemented, tried, and then
+> **removed**  a single run suggested it hurt. See the decisions log in
+> `S2A_DESIGN.md`. The clothing branch is a single label-smoothed CE head; there is
+> no detached discriminator, no second optimizer and no start-epoch gate.
 
 `MODEL.PRETRAIN` exists in the config but is **not used by the training code**
 (`train.py`/`make_model` never call `load_parameter`). The backbone is trained
@@ -296,8 +271,8 @@ classes), model build, one full epoch of the real loop, both evaluation protocol
 ## 4. Constraints worth knowing before changing things
 
 1. **`F` and `F'` must have the same width.** The separation loss compares them
-   1:1. If you set `CLOTH_FEAT_DIM != 2048`, `DisentangleLoss` raises rather
-   than silently projecting — add an explicit projector if you need asymmetry.
+   1:1. Both are `MODEL.S2A_BRANCH_WIDTH` wide by construction, so this only
+   matters if a future branch is given a different width.
 2. **`MODEL.NECK` applies to `F` only.** `F'` always goes through its own
    `cloth_bottleneck` (BatchNorm1d).
 3. **`F'`'s BatchNorm falls back to running statistics** when a batch contains a
@@ -324,11 +299,11 @@ halfway through a GPU run.
 
 | script | what it proves |
 |---|---|
-| `scripts/compare_with_csci.py` | **the definitive check**: re-derives every split, pid, camid and cloth id directly from the filesystem using CSCI's own formulas, then compares against our loaders — per-image, and reports whether the cloth *label numbering* matches, not just the grouping |
+| `scripts/compare_with_csci.py` | **the definitive check**: re-derives every split, pid, camid and cloth id directly from the filesystem using CSCI's own formulas, then compares against our loaders  per-image, and reports whether the cloth *label numbering* matches, not just the grouping |
 | `scripts/audit_real_datasets.py` | split/label semantics, official PRCC counts, CC-rule effectiveness, triplets' reachable positives (runs on the real data) |
 | `scripts/real_data_cpu_check.py` | real batches + full real query/gallery evaluation through the processor (CPU, slow) |
 | `scripts/verify_alignment.py` | dual-branch shapes, losses, CC vs General metric, triplet == CSCI reference (26+ assertions) |
-| `scripts/train_smoke_test.py` | the real `do_train` runs end to end: train → dual-protocol eval → checkpoint |
+| `scripts/train_smoke_test.py` | the real `do_train` runs end to end: train ↀdual-protocol eval ↀcheckpoint |
 | `scripts/infer_smoke_test.py` | `load_parameter` + `do_inference` reproduces the training-time metrics |
 | `scripts/preflight_3090.py` | **run this on the GPU host**: CUDA build/visibility, AMP fwd+bwd on GPU, peak VRAM, dataset layout, one real train+eval step |
 
@@ -340,8 +315,7 @@ python scripts/train_smoke_test.py       # end-to-end training
 python scripts/infer_smoke_test.py       # run after train_smoke_test
 ```
 
-Last verified result on the local data: `DATASET LAYER IS IDENTICAL TO CSCI` —
-PRCC (train/val/test-A/test-B/test-C) and LTCC (train/query/test) are per-image
+Last verified result on the local data: `DATASET LAYER IS IDENTICAL TO CSCI`  PRCC (train/val/test-A/test-B/test-C) and LTCC (train/query/test) are per-image
 identical in image set, `pid`, `camid` and `cloth_id`, **including the cloth
 label numbering**.
 
@@ -365,9 +339,9 @@ label numbering**.
 ```
 <ROOT>/
 ├── prcc/rgb/
-│   ├── train/<pid>/<A|B|C>_cropped_rgb###.jpg
-│   ├── val/<pid>/<A|B|C>_cropped_rgb###.jpg
-│   └── test/{A,B,C}/<pid>/cropped_rgb###.jpg
+─  ├── train/<pid>/<A|B|C>_cropped_rgb###.jpg
+─  ├── val/<pid>/<A|B|C>_cropped_rgb###.jpg
+─  └── test/{A,B,C}/<pid>/cropped_rgb###.jpg
 └── LTCC_ReID/
     ├── train/<pid>_<cam>_c<cloth>_<frame>.png
     ├── query/<pid>_<cam>_c<cloth>_<frame>.png

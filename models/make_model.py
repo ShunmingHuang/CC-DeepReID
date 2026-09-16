@@ -1,9 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .backbones import resnet50
-from .attention import DualBranchChannelAttention
+from .backbones.resnet import resnet50
+from .backbones.s2a_resnet import s2a_resnet50
 from .classifier import build_classifier
+
 
 def weights_init_kaiming(m):
     classname = m.__class__.__name__
@@ -20,6 +21,7 @@ def weights_init_kaiming(m):
             nn.init.constant_(m.weight, 1.0)
             nn.init.constant_(m.bias, 0.0)
 
+
 def weights_init_classifier(m):
     classname = m.__class__.__name__
     if classname.find('Linear') != -1:
@@ -27,23 +29,27 @@ def weights_init_classifier(m):
         if m.bias:
             nn.init.constant_(m.bias, 0.0)
 
+
 class ResNet(nn.Module):
-    """ResNet50 backbone + dual-branch channel attention.
+    """Shared ResNet50 trunk with two channel-isolated branches.
+
+    The trunk is ``models/backbones/s2a_resnet.py``: ``B`` branches live in
+    contiguous channel blocks of the shared feature map, and every convolution uses
+    ``groups=B``, so **no weight and no gradient crosses the branches at any depth**
+    (this replaces the earlier dual SE channel-attention module).
 
     Forward outputs:
 
     * ``training`` -> ``(id_score, F, cloth_score, F', global_feat, map_id, map_cloth, hist_pred)``
-      where ``map_id`` / ``map_cloth`` are the attention-weighted maps **before
-      pooling** (``(B, 2048, H/16, W/16)``), available for other modules, and
-      ``hist_pred`` is the colour-histogram regression off ``F'`` (``None`` when
-      ``MODEL.USE_HIST`` is off).
-    * ``eval``     -> ``F`` only (retrieval still uses ``F``)
+      ``map_id`` / ``map_cloth`` are the branch maps **before pooling** -- here they
+      are simply the two channel blocks of the trunk output, so downstream modules
+      still get un-pooled spatial features. ``hist_pred`` is the colour-histogram
+      regression off ``F'`` (``None`` when ``MODEL.USE_HIST`` is off).
+    * ``eval``     -> ``F`` only (retrieval still uses the identity branch)
 
-    ``F`` is the identity branch (ID + triplet loss). ``F'`` is the
-    **identity-independent** branch: clothing classification is only the
-    supervision currently attached to it, not its definition; further modules are
-    meant to attach to that branch. ``global_feat`` is the plain pooled backbone
-    descriptor, kept for backward compatibility.
+    ``F`` is the identity branch. ``F'`` is the **identity-independent** branch:
+    clothing classification is only the supervision currently attached to it, not
+    its definition.
     """
 
     def __init__(
@@ -56,26 +62,25 @@ class ResNet(nn.Module):
         last_stride = cfg.MODEL.LAST_STRIDE
         self.neck = cfg.MODEL.NECK
         self.neck_feat = cfg.TEST.NECK_FEAT
-        self.in_planes = 2048
         self.num_classes = num_classes
-        self.base = resnet50(last_stride=last_stride)
 
+        self.num_branches = int(getattr(cfg.MODEL, 'S2A_BRANCHES', 2))
+        self.branch_width = int(getattr(cfg.MODEL, 'S2A_BRANCH_WIDTH', 2048))
+        self.s2a_mode = getattr(cfg.MODEL, 'S2A_MODE', 's2a')
         self.dual_branch = getattr(cfg.MODEL, 'DUAL_BRANCH', True)
 
         if self.dual_branch:
-            cloth_feat_dim = getattr(cfg.MODEL, 'CLOTH_FEAT_DIM', -1)
-            if cloth_feat_dim is None or cloth_feat_dim <= 0:
-                cloth_feat_dim = self.in_planes
-            self.channel_attention = DualBranchChannelAttention(
-                channels=self.in_planes,
-                reduction=getattr(cfg.MODEL, 'ATT_REDUCTION', 16),
-                cloth_feat_dim=cloth_feat_dim,
-                projector=bool(getattr(cfg.MODEL, 'ATT_PROJECTOR', False)),
-            )
-            feat_dim = cloth_feat_dim
+            # the map is num_branches x branch_width wide; branch 0 is F, 1 is F'
+            self.base = s2a_resnet50(num_branches=self.num_branches,
+                                     branch_width=self.branch_width,
+                                     last_stride=last_stride,
+                                     mode=self.s2a_mode)
+            self.in_planes = self.branch_width
         else:
-            self.channel_attention = None
-            feat_dim = self.in_planes
+            self.base = resnet50(last_stride=last_stride)
+            self.in_planes = 2048
+
+        feat_dim = self.in_planes
 
         self.bottleneck = nn.BatchNorm1d(self.in_planes)
         self.bottleneck.bias.requires_grad_(False)
@@ -120,6 +125,10 @@ class ResNet(nn.Module):
         else:
             self.hist_head = None
 
+    @staticmethod
+    def _pool(z):
+        return nn.functional.avg_pool2d(z, z.shape[2:4]).view(z.shape[0], -1)
+
     def load_parameter(self, trained_path):
         param_dict = torch.load(trained_path)
         if 'state_dict' in param_dict:
@@ -137,35 +146,21 @@ class ResNet(nn.Module):
         counts = torch.bincount(target_cloth.detach().view(-1))
         return bool(counts.numel() == 0 or counts.min().item() >= 2)
 
-    def forward(self, x, target_cloth=None, detach_cloth=False):
-        x = self.base(x)
+    def forward(self, x, target_cloth=None):
+        feat_map = self.base(x)
 
         if self.dual_branch:
-            # channel attention first, pooling afterwards; the attention-weighted
-            # maps (still B,C,H,W) stay available to downstream modules
-            att = self.channel_attention(x)
-            feat_id_raw, feat_cloth_raw = att.feat_id, att.feat_cloth
-            map_id, map_cloth = att.map_id, att.map_cloth
+            # the trunk already carries B channel-isolated branches; the first two
+            # are the identity and the identity-independent one
+            map_id, map_cloth = self.base.split_branches(feat_map)[:2]
+            feat_id_raw = self._pool(map_id)
+            feat_cloth_raw = self._pool(map_cloth)
         else:
-            feat_id_raw = nn.functional.avg_pool2d(x, x.shape[2:4])
-            feat_id_raw = feat_id_raw.view(feat_id_raw.shape[0], -1)
-            feat_cloth_raw = None
             map_id, map_cloth = None, None
+            feat_id_raw = self._pool(feat_map)
+            feat_cloth_raw = None
 
-        if detach_cloth and feat_cloth_raw is not None:
-            # C2R-ReID's discriminator path. The gradient must not reach the
-            # backbone: detach the attention-weighted map AND keep the head free of
-            # any parameterised normalisation, otherwise the norms' own weights
-            # create a fresh grad_fn and this stops being a "frozen feature" probe.
-            detached = self.channel_attention.pool(map_cloth.detach())
-            cloth_score = (self.cloth_classifier(detached)
-                           if self.cloth_classifier is not None else None)
-            global_feat = nn.functional.avg_pool2d(x, x.shape[2:4])
-            global_feat = global_feat.view(global_feat.shape[0], -1)
-            return cloth_score, None, None, detached, global_feat, None, None, None
-
-        global_feat = nn.functional.avg_pool2d(x, x.shape[2:4])
-        global_feat = global_feat.view(global_feat.shape[0], -1)
+        global_feat = self._pool(feat_map)
 
         if self.neck == 'bnneck':
             feat = self.bottleneck(feat_id_raw)
@@ -192,9 +187,8 @@ class ResNet(nn.Module):
 
             # Training return, in order:
             #   id_score, F, cloth_score, F', global_feat, map_id, map_cloth, hist_pred
-            # map_id / map_cloth are the attention-weighted maps BEFORE pooling,
-            # for any module that wants to work on the spatial features.
-            # hist_pred is the colour-histogram regression off F' (None if disabled).
+            # map_id / map_cloth are the branch maps BEFORE pooling, for any module
+            # that wants to work on the spatial features.
             hist_pred = self.hist_head(feat_cloth_raw) if self.hist_head is not None \
                 else None
             return (cls_score, feat, cloth_score, cloth_feat, global_feat,

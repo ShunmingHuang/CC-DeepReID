@@ -15,15 +15,17 @@ MODEL:
   FEAT_DIM: 2048
   NO_MARGIN: False
   LABELSMOOTH: True
-  # ---- dual-branch channel attention behind the backbone ----
+  # ---- dual-branch shared trunk (S2A-style) ----
   #  F  = identity branch               : ID + triplet
-  #  F' = identity-independent branch   : currently supervised by the cloth
-  #       softmax (+ optional CAL / colour histogram); other modules go here later
+  #  F' = identity-independent branch   : cloth softmax (+ optional histogram)
   #  F vs F'                            : pushed apart (orthogonal)
+  #  The two branches are contiguous channel blocks of ONE shared feature map.
+  #  HOW they are kept apart is MODEL.S2A_MODE -- see the sibling configs
+  #  (s2a.yaml = CSCI's mechanism, sealed.yaml = strict groups=B isolation).
   DUAL_BRANCH: True
-  ATT_REDUCTION: 16
-  CLOTH_FEAT_DIM: -1        # -1 -> F' keeps 2048 dims (same width as F)
-  ATT_PROJECTOR: False
+  S2A_MODE: "s2a"           # 's2a' (matches CSCI) | 'sealed'
+  S2A_BRANCHES: 2           # branch 0 = F (identity), branch 1 = F' (identity-indep.)
+  S2A_BRANCH_WIDTH: 2048    # width of ONE branch; the map is B x this
   CLOTH_LOSS_WEIGHT: 1.0
   DISENTANGLE_WEIGHT: 1.0
   DISENTANGLE_MARGIN: null  # null -> |cos| (CSCI); a float switches to a hinge
@@ -34,16 +36,6 @@ MODEL:
   #             class weights, logits = CLOTH_HEAD_SCALE * cos)
   CLOTH_HEAD: "linear"
   CLOTH_HEAD_SCALE: 16.0
-
-  # ---- C2R-ReID clothes-based adversarial loss (CAL) ----
-  #  the clothing discriminator trains on DETACHED F' with its own optimizer,
-  #  starting at CAL_START_EPOCH; the backbone sees the same loss on live F'
-  USE_CAL: False
-  CAL_WEIGHT: 1.0
-  CAL_SCALE: 16.0
-  CAL_EPSILON: 0.1
-  CAL_START_EPOCH: 25       # 1-based epoch at which CAL switches on
-  CAL_LR: 3.5e-4
 
   # ---- colour-histogram regression on F' (CSCI profile-44 recipe) ----
   #  annotation-free target: RGB-uv histogram of the same augmented image.
@@ -84,7 +76,10 @@ DATASETS:
 DATALOADER:
   NUM_WORKERS: 8
   SAMPLER: "triplet"
-  NUM_INSTANCE: 16
+  # LTCC rarely has 16 images per identity per batch, and its splits are ~2.3x
+  # PRCC's, so the recipe is 32/8 rather than PRCC's 64/16.
+  # Keep IMS_PER_BATCH = num_ids_per_batch * NUM_INSTANCE.
+  NUM_INSTANCE: 8
 
 # -----------------------------------------------------------------------------
 # SOLVER
@@ -107,7 +102,7 @@ SOLVER:
   CHECKPOINT_PERIOD: 10
   LOG_PERIOD: 10
   EVAL_PERIOD: 10
-  IMS_PER_BATCH: 64
+  IMS_PER_BATCH: 32
 
 # -----------------------------------------------------------------------------
 # TEST

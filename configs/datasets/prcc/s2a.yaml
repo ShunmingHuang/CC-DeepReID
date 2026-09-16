@@ -1,5 +1,23 @@
-# PRCC Dataset Configuration for ResNet
-# Based on configs/default.py
+# PRCC + ResNet50, S2A_MODE = 's2a'
+#
+# This is the CSCI transcription: ONE shared trunk carrying a shared spatial
+# scene (conv_kv, updated every block by its own unmasked self-attention) that
+# both branches READ, with only the decision isolated (each branch has its own
+# query/key, and neither appears in the other's read).
+#
+# Measured topology (scripts/compare_variants.py, layer4[0], same seed):
+#   perturb branch 0 -> branch 0 out : 1.774e+00   (must move)
+#   perturb branch 0 -> branch 1 out : 1.411e+00   (COUPLED -- by design)
+#   params: trunk 64.01M, whole model 64.94M
+#
+# The coupling is the point: the scene is a shared bottleneck both branches can
+# write into, which is what CSCI's S2A relies on. It also means the cloth loss
+# changes F's features, so the two losses are NOT independently ablatable here.
+# For the opposite trade see configs/datasets/prcc/sealed.yaml.
+#
+# Run:
+#   python train.py --config_file configs/datasets/prcc/s2a.yaml \
+#       DATASETS.ROOT_DIR /path/to/data SOLVER.IMS_PER_BATCH 64
 
 # -----------------------------------------------------------------------------
 # MODEL
@@ -15,40 +33,30 @@ MODEL:
   FEAT_DIM: 2048
   NO_MARGIN: False
   LABELSMOOTH: True
-  # ---- dual-branch shared trunk (S2A-style) ----
-  #  F  = identity branch               : ID + triplet
-  #  F' = identity-independent branch   : cloth softmax (+ optional histogram)
-  #  F vs F'                            : pushed apart (orthogonal)
-  #  The two branches are contiguous channel blocks of ONE shared feature map.
-  #  HOW they are kept apart is MODEL.S2A_MODE -- see the sibling configs
-  #  (s2a.yaml = CSCI's mechanism, sealed.yaml = strict groups=B isolation).
+
+  # ---- dual-branch trunk ----
   DUAL_BRANCH: True
-  S2A_MODE: "s2a"           # 's2a' (matches CSCI) | 'sealed'
+  S2A_MODE: "s2a"           # shared scene, isolated decision (CSCI's mechanism)
   S2A_BRANCHES: 2           # branch 0 = F (identity), branch 1 = F' (identity-indep.)
   S2A_BRANCH_WIDTH: 2048    # width of ONE branch; the map is B x this
-  CLOTH_LOSS_WEIGHT: 1.0
-  DISENTANGLE_WEIGHT: 1.0
+  CLOTH_LOSS_WEIGHT: 1.0    # weight of the F' clothing softmax
+  DISENTANGLE_WEIGHT: 1.0   # weight of the F / F' separation term
   DISENTANGLE_MARGIN: null  # null -> |cos| (CSCI); a float switches to a hinge
 
   # ---- clothing classification head (on F') ----
-  #  'linear' : plain dot-product head
-  #  'cosine' : C2R-ReID's NormalizedClassifier (L2-normalised features AND
-  #             class weights, logits = CLOTH_HEAD_SCALE * cos)
-  CLOTH_HEAD: "linear"
-  CLOTH_HEAD_SCALE: 16.0
+  CLOTH_HEAD: "linear"      # 'linear' | 'cosine' (C2R's NormalizedClassifier)
+  CLOTH_HEAD_SCALE: 16.0    # only used when CLOTH_HEAD == 'cosine'
 
   # ---- colour-histogram regression on F' (CSCI profile-44 recipe) ----
-  #  annotation-free target: RGB-uv histogram of the same augmented image.
-  #  Runs ALONGSIDE the cloth softmax, which is kept.
-  USE_HIST: False
-  HIST_DIM: 32              # bins per axis; label/head output length = HIST_DIM**2
+  USE_HIST: False           # turn on to run the extra annotation-free target
+  HIST_DIM: 32
   HIST_HIDDEN: 1024
   HIST_SIGMA: 0.001
   HIST_INTENSITY_SCALE: False
-  HIST_NORM: "l1"           # 'l1' | 'l2' | null
+  HIST_NORM: "l1"
   HIST_NORM_P: 1
-  HIST_WEIGHT_SCALE: 100.0  # CSCI's wt
-  HIST_LOSS: "cosine"       # 'cosine' (1-|cos|) | 'mse' | 'l1'
+  HIST_WEIGHT_SCALE: 100.0
+  HIST_LOSS: "cosine"
   HIST_LOSS_WEIGHT: 1.0
 
 # -----------------------------------------------------------------------------
@@ -68,7 +76,7 @@ INPUT:
 # -----------------------------------------------------------------------------
 DATASETS:
   NAMES: "prcc"
-  ROOT_DIR: "../data"
+  ROOT_DIR: "../data"       # override with DATASETS.ROOT_DIR <path>
 
 # -----------------------------------------------------------------------------
 # DATALOADER
@@ -76,7 +84,7 @@ DATASETS:
 DATALOADER:
   NUM_WORKERS: 8
   SAMPLER: "triplet"
-  NUM_INSTANCE: 16
+  NUM_INSTANCE: 16          # keep IMS_PER_BATCH = num_ids_per_batch * NUM_INSTANCE
 
 # -----------------------------------------------------------------------------
 # SOLVER
@@ -91,6 +99,7 @@ SOLVER:
   WEIGHT_DECAY: 0.0005
   WEIGHT_DECAY_BIAS: 0.0005
   WARMUP_EPOCHS: 5
+  WARMUP_TYPE: "linear"
   COSINE_MARGIN: 0.5
   COSINE_SCALE: 30
   LR_SCHEDULER: "cosine"
@@ -109,14 +118,14 @@ TEST:
   WEIGHT: ""
   NECK_FEAT: "after"
   FEAT_NORM: True
-  # 'both' -> report CC (test/C query) AND Standard (test/B query) over gallery=test/A
-  # 'cc'   -> report only the clothes-changing protocol (CSCI's published tables)
-  MODE: "both"
-  EVAL_PROTOCOL: "CC"
+  # PRCC gallery is test/A; query_diff is test/C (clothes-changing) and
+  # query_same is test/B (the standard protocol)
+  MODE: "both"              # 'both' | 'cc'
+  EVAL_PROTOCOL: "CC"       # which protocol selects the best checkpoint
 
 # -----------------------------------------------------------------------------
 # Misc
 # -----------------------------------------------------------------------------
-EXP_NAME: "prcc_resnet"
+EXP_NAME: "prcc_resnet_s2a"
 LOG_DIR: "logs/prcc"
 OUTPUT_DIR: "outputs/prcc"

@@ -21,8 +21,7 @@ def build_optimizer(
     adam_beta2=0.99,
     staged_lr=False,
     new_layers='',
-    base_lr_mult=0.1,
-    exclude=None
+    base_lr_mult=0.1
 ):
     """A function wrapper for building an optimizer.
 
@@ -76,14 +75,6 @@ def build_optimizer(
             'model given to build_optimizer must be an instance of nn.Module'
         )
 
-    if exclude is None:
-        exclude = []
-    elif isinstance(exclude, str):
-        exclude = [exclude]
-
-    def _excluded(name):
-        return any(name == e or name.startswith(e + '.') for e in exclude)
-
     if staged_lr:
         if isinstance(new_layers, str):
             if new_layers is None:
@@ -100,8 +91,6 @@ def build_optimizer(
         new_params = []
 
         for name, module in model.named_children():
-            if _excluded(name):
-                continue
             if name in new_layers:
                 new_params += [p for p in module.parameters()]
             else:
@@ -119,12 +108,7 @@ def build_optimizer(
         ]
 
     else:
-        # keep the same ordering as model.parameters() but skip excluded submodules
-        param_groups = [p for name, p in model.named_parameters()
-                        if not _excluded(name)]
-        if not param_groups:
-            raise ValueError('build_optimizer: every parameter was excluded by '
-                             'exclude={}'.format(exclude))
+        param_groups = model.parameters()
 
     if optim == 'adam':
         optimizer = torch.optim.Adam(

@@ -145,16 +145,13 @@ def objective(trial, config_file, num_trials, epochs):
     loss_func = make_loss(fresh_cfg, num_classes=bundle.num_train_pids,
                           num_cloth_classes=num_cloth_classes)
 
-    # Create optimizer (clothing classifier is owned by the CAL discriminator
-    # optimizer when USE_CAL is on, so keep it out of the main optimizer)
-    exclude_from_main = ['cloth_classifier'] if fresh_cfg.MODEL.USE_CAL else []
+    # Create optimizer
     optimizer = build_optimizer(
         model,
         optim=fresh_cfg.SOLVER.OPTIMIZER_NAME.lower() if fresh_cfg.SOLVER.OPTIMIZER_NAME.lower() in ['adam', 'amsgrad', 'sgd', 'rmsprop', 'radam'] else 'adam',
         lr=fresh_cfg.SOLVER.BASE_LR,
         weight_decay=fresh_cfg.SOLVER.WEIGHT_DECAY,
-        momentum=fresh_cfg.SOLVER.MOMENTUM,
-        exclude=exclude_from_main
+        momentum=fresh_cfg.SOLVER.MOMENTUM
     )
 
     # Create scheduler
